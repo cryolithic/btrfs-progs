@@ -42,4 +42,6 @@ extern const u8 raid6_gfexi[256]      __attribute__((aligned(256)));
 /* Recover raid6 with 2 data corrupted */
 int raid6_recov_data2(int nr_devs, size_t stripe_len, int dest1, int dest2,
 		      void **data);
+/* Recover data and P */
+int raid6_recov_datap(int nr_devs, size_t stripe_len, int dest1, void **data);
 #endif
