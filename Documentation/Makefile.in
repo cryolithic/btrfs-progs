@@ -11,6 +11,7 @@ MAN8_TXT += btrfs-select-super.asciidoc
 MAN8_TXT += btrfstune.asciidoc
 MAN8_TXT += fsck.btrfs.asciidoc
 MAN8_TXT += mkfs.btrfs.asciidoc
+MAN8_TXT += btrfs-modify.asciidoc
 
 # Sub commands for btrfs
 MAN8_TXT += btrfs-subvolume.asciidoc

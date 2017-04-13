@@ -168,7 +168,7 @@ endif
 MAKEOPTS = --no-print-directory Q=$(Q)
 
 # build all by default
-progs = $(progs_install) btrfsck btrfs-corrupt-block
+progs = $(progs_install) btrfsck btrfs-corrupt-block btrfs-modify
 
 # install only selected
 progs_install = btrfs mkfs.btrfs btrfs-debug-tree \
@@ -393,6 +393,14 @@ btrfs-image: image/main.o $(objects) $(libs_static)
 btrfs-image.static: image/main.static.o $(static_objects) $(static_libbtrfs_objects)
 	@echo "    [LD]     $@"
 	$(Q)$(CC) $(STATIC_CFLAGS) -o $@ $^ $(STATIC_LDFLAGS) $(STATIC_LIBS) $(STATIC_LIBS_COMP)
+
+btrfs-modify: modify/main.o $(objects) $(libs_static)
+	@echo "    [LD]     $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS) $(LIBS_COMP)
+
+btrfs-modify.static: modify/main.static.o $(static_objects) $(static_libbtrfs_objects)
+	@echo "    [LD]     $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(STATIC_LDFLAGS) $(STATIC_LIBS) $(STATIC_LIBS_COMP)
 
 btrfs-convert: $(convert_objects) $(objects) $(libs_static)
 	@echo "    [LD]     $@"

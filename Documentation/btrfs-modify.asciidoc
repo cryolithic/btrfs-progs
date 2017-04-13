@@ -1,0 +1,35 @@
+btrfs-modify(8)
+===============
+
+NAME
+----
+btrfs-modify - modify variant internal structure of a unmounted btrfs
+
+SYNOPSIS
+--------
+*btrfs-modify* <command> <options> <device>
+
+DESCRIPTION
+-----------
+*btrfs-modify* is used to modify variant btrfs internal structures, either for
+experienced user to fix filesystem, or corrupt fs for test purpose.
+
+COMMANDS
+--------
+Nothing yet
+
+OPTIONS
+-------
+Nothing yet
+
+AVAILABILITY
+------------
+*btrfs-modify* is part of btrfs-progs.
+Please refer to the btrfs wiki http://btrfs.wiki.kernel.org for
+further details.
+
+SEE ALSO
+--------
+`btrfs`(5),
+`btrfs`(8),
+`btrfs-inspect-internal`(8)
