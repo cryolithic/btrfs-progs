@@ -111,4 +111,8 @@ int cmd_dump_super(int argc, char **argv);
 int cmd_debug_tree(int argc, char **argv);
 int cmd_rescue(int argc, char **argv);
 
+const struct cmd_struct *
+parse_command_token(const char *arg, const struct cmd_group *grp);
+void handle_help_options_next_level(const struct cmd_struct *cmd,
+				    int argc, char **argv);
 #endif
