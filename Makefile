@@ -103,6 +103,7 @@ cmds_objects = cmds-subvolume.o cmds-filesystem.o cmds-device.o cmds-scrub.o \
 	       cmds-property.o cmds-fi-usage.o cmds-inspect-dump-tree.o \
 	       cmds-inspect-dump-super.o cmds-inspect-tree-stats.o cmds-fi-du.o \
 	       mkfs/common.o
+modify_objects = modify/mirror.o
 libbtrfs_objects = send-stream.o send-utils.o kernel-lib/rbtree.o btrfs-list.o \
 		   kernel-lib/crc32c.o messages.o \
 		   uuid-tree.o utils-lib.o rbtree-utils.o
@@ -394,11 +395,11 @@ btrfs-image.static: image/main.static.o $(static_objects) $(static_libbtrfs_obje
 	@echo "    [LD]     $@"
 	$(Q)$(CC) $(STATIC_CFLAGS) -o $@ $^ $(STATIC_LDFLAGS) $(STATIC_LIBS) $(STATIC_LIBS_COMP)
 
-btrfs-modify: modify/main.o $(objects) $(libs_static)
+btrfs-modify: modify/main.o $(modify_objects) $(objects) $(libs_static)
 	@echo "    [LD]     $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS) $(LIBS_COMP)
 
-btrfs-modify.static: modify/main.static.o $(static_objects) $(static_libbtrfs_objects)
+btrfs-modify.static: modify/main.static.o $(static_objects) $(static_libbtrfs_objects) $(modify_objects)
 	@echo "    [LD]     $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(STATIC_LDFLAGS) $(STATIC_LIBS) $(STATIC_LIBS_COMP)
 
@@ -514,6 +515,7 @@ clean: $(CLEANDIRS)
 		image/*.o image/*.o.d \
 		convert/*.o convert/*.o.d \
 		mkfs/*.o mkfs/*.o.d \
+		modify/*.o modify/*.o.d \
 	      dir-test ioctl-test quick-test library-test library-test-static \
 	      btrfs.static mkfs.btrfs.static fssum \
 	      $(check_defs) \

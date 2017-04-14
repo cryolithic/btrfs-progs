@@ -16,11 +16,35 @@ experienced user to fix filesystem, or corrupt fs for test purpose.
 
 COMMANDS
 --------
-Nothing yet
+*mirror*::
+Modify specified mirror, including RAID56 P/Q stripe.
 
 OPTIONS
 -------
-Nothing yet
+*Mirror command options*::
+--logical <address>::::
+Specify the start logical address to modify. Must be aligned to sectorsize.
++
+Must be specified
+
+--length <length>::::
+Specify the length to modify. Must be aligned to sectorsize.
++
+Default value is the sectorsize of the filesystem, if not specified.
+
+--stripe <stripe number>::::
+Specify the stripe number to modify.
++
+0 for 1st data stripe. All profiles support stripe number 0. +
+1 for backup data stripe. Only mirror based profiles (DUP,RAID1,RAID10) support
+stripe number 1.
+P for RAID56 1st parity stripe. Only RAID5 and RAID6 support stripe number P.
+Q for RAID6 2nd parity stripe.
+
+EXIT STATUS
+-----------
+*btrfs-modify* returns a zero exit status if all its operations succeed.
+None zero is returned if any error happens.
 
 AVAILABILITY
 ------------

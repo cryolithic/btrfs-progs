@@ -33,6 +33,7 @@
 #include "help.h"
 #include "commands.h"
 #include "crc32c.h"
+#include "modify/modify_commands.h"
 
 const char * const modify_group_usage[] = {
 	"btrfs-modify <command> <dest_options> <device>",
@@ -53,6 +54,7 @@ static const char modify_group_info[] =
 
 static const struct cmd_group modify_cmd_group = {
 	modify_group_usage, modify_group_info, {
+		{ "mirror", modify_mirror, modify_mirror_usage, NULL, 0 },
 		NULL_CMD_STRUCT
 	},
 };
