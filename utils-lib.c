@@ -44,6 +44,21 @@ u64 arg_strtou64(const char *str)
 }
 
 /*
+ * u32 version of arg_strtou*()
+ */
+u32 arg_strtou32(const char *str)
+{
+	u64 tmp;
+
+	tmp = arg_strtou64(str);
+	if (tmp >= UINT32_MAX) {
+		fprintf(stderr, "ERROR: %s is too large.\n", str);
+		exit(1);
+	}
+	return (u32)tmp;
+}
+
+/*
  * For a given:
  * - file or directory return the containing tree root id
  * - subvolume return its own tree id
