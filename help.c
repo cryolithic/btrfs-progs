@@ -262,7 +262,8 @@ static void usage_command_group_internal(const struct cmd_group *grp, int full,
 	}
 }
 
-void usage_command_group_short(const struct cmd_group *grp)
+void usage_command_group_short(const struct cmd_group *grp,
+			       const char * const *short_desc)
 {
 	const char * const *usagestr = grp->usagestr;
 	FILE *outf = stdout;
@@ -298,12 +299,11 @@ void usage_command_group_short(const struct cmd_group *grp)
 		fprintf(outf, "  %-16s  %s\n", cmd->token, cmd->usagestr[1]);
 	}
 
-	fputc('\n', outf);
-	fprintf(stderr, "For an overview of a given command use 'btrfs command --help'\n");
-	fprintf(stderr, "or 'btrfs [command...] --help --full' to print all available options.\n");
-	fprintf(stderr, "Any command name can be shortened as far as it stays unambiguous,\n");
-	fprintf(stderr, "however it is recommended to use full command names in scripts.\n");
-	fprintf(stderr, "All command groups have their manual page named 'btrfs-<group>'.\n");
+	if (short_desc) {
+		fputc('\n', outf);
+		while (*short_desc && **short_desc)
+			fprintf(outf, "%s\n", *short_desc++);
+	}
 }
 
 void usage_command_group(const struct cmd_group *grp, int full, int err)

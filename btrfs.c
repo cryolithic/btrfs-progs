@@ -24,6 +24,15 @@
 #include "utils.h"
 #include "help.h"
 
+static const char * const btrfs_short_desc[] = {
+	"For an overview of a given command use 'btrfs command --help'",
+	"or 'btrfs [command...] --help --full' to print all available options.",
+	"Any command name can be shortened as far as it stays unambiguous,",
+	"however it is recommended to use full command names in scripts.",
+	"All command groups have their manual page named 'btrfs-<group>'.",
+	NULL
+};
+
 static const char * const btrfs_cmd_group_usage[] = {
 	"btrfs [--help] [--version] <group> [<group>...] <command> [<args>]",
 	NULL
@@ -126,7 +135,8 @@ int main(int argc, char **argv)
 			if (!prefixcmp(argv[0], "--"))
 				argv[0] += 2;
 		} else {
-			usage_command_group_short(&btrfs_cmd_group);
+			usage_command_group_short(&btrfs_cmd_group,
+						  btrfs_short_desc);
 			exit(1);
 		}
 	}
