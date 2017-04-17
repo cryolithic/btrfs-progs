@@ -373,13 +373,15 @@ int modify_mirror(int argc, char **argv)
 	char *device;
 	u64 length = (u64)-1;
 	u64 logical = (u64)-1;
+	u32 pattern = 0x66524842;
 	int stripe = STRIPE_UNINITILIZED;
 	int ret;
 
 	while (1) {
 		int c;
 		enum { GETOPT_VAL_LOGICAL = 257, GETOPT_VAL_LENGTH,
-			GETOPT_VAL_STRIPE, GETOPT_VAL_ROOT_INO_OFFSET };
+			GETOPT_VAL_STRIPE, GETOPT_VAL_ROOT_INO_OFFSET,
+			GETOPT_VAL_PATTERN };
 		static const struct option long_options[] = {
 			{ "logical", required_argument, NULL,
 				GETOPT_VAL_LOGICAL },
@@ -388,6 +390,8 @@ int modify_mirror(int argc, char **argv)
 			{ "stripe", required_argument, NULL, GETOPT_VAL_STRIPE },
 			{ "root-ino-offset", required_argument, NULL,
 				GETOPT_VAL_ROOT_INO_OFFSET},
+			{ "pattern", required_argument, NULL,
+				GETOPT_VAL_PATTERN},
 			{ NULL, 0, NULL, 0 }
 		};
 
@@ -406,6 +410,9 @@ int modify_mirror(int argc, char **argv)
 			break;
 		case GETOPT_VAL_ROOT_INO_OFFSET:
 			parse_root_ino_offset(&dest, optarg);
+			break;
+		case GETOPT_VAL_PATTERN:
+			pattern = arg_strtou32(optarg);
 			break;
 		case '?':
 		case 'h':
@@ -438,6 +445,8 @@ int modify_mirror(int argc, char **argv)
 		printf("--stripe not specified, fallback to 0 (1st stripe)\n");
 		stripe = 0;
 	}
+
+	memset(write_buf, pattern, sizeof(write_buf) / sizeof(pattern));
 
 	fs_info = open_ctree_fs_info(device, 0, 0, 0, OPEN_CTREE_WRITES);
 	if (!fs_info) {

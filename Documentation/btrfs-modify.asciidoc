@@ -41,6 +41,11 @@ stripe number 1.
 P for RAID56 1st parity stripe. Only RAID5 and RAID6 support stripe number P.
 Q for RAID6 2nd parity stripe.
 
+--pattern <pattern>::::
+Specify to pattern to modify the mirror data5f536652.
++
+Default value is "0x66524842" (ascii "BHRf", part of the btrfs magic "_BHRfS_M").
+
 EXIT STATUS
 -----------
 *btrfs-modify* returns a zero exit status if all its operations succeed.
