@@ -13,11 +13,7 @@ dmname=\
 btrfs-test-with-very-long-name-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 dmdev=/dev/mapper/$dmname
 
-run_check truncate -s0 img
-chmod a+w img
-run_check truncate -s2g img
-
-loopdev=`run_check_stdout $SUDO_HELPER losetup --find --show img`
+loopdev=$(prepare_loop_dev img)
 run_check $SUDO_HELPER dmsetup create $dmname --table "0 1048576 linear $loopdev 0"
 
 dmbase=`readlink -f $dmdev`
@@ -36,5 +32,5 @@ run_check $SUDO_HELPER $TOP/btrfs inspect-internal dump-super $dmdev
 
 # cleanup
 run_check $SUDO_HELPER dmsetup remove $dmname
-run_mayfail $SUDO_HELPER losetup -d $loopdev
-run_check truncate -s0 img
+cleanup_loop_dev img
+rm img

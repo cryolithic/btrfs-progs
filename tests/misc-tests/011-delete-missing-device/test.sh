@@ -16,21 +16,15 @@ setup_root_helper
 prepare_devices()
 {
 	for i in `seq $ndevs`; do
-		touch img$i
-		chmod a+rw img$i
-		truncate -s0 img$i
-		truncate -s2g img$i
-		devs[$i]=`run_check_stdout $SUDO_HELPER losetup --find --show img$i`
+		devs[$i]=$(prepare_loop_dev img$i)
 	done
 }
 
 cleanup_devices()
 {
-	for dev in ${devs[@]}; do
-		run_mayfail $SUDO_HELPER losetup -d $dev
-	done
 	for i in `seq $ndevs`; do
-		truncate -s0 img$i
+		cleanup_loop_dev img$i
+		rm img$i
 	done
 	run_check $SUDO_HELPER losetup --all
 }

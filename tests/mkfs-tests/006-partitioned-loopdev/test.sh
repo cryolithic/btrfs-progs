@@ -12,12 +12,8 @@ check_prereq mkfs.btrfs
 
 setup_root_helper
 
-run_check truncate -s0 img
-chmod a+w img
 cp partition-1g-1g img
-run_check truncate -s2g img
-
-loopdev=$(run_check_stdout $SUDO_HELPER losetup --partscan --find --show img)
+loopdev=$(prepare_loop_dev img)
 base=$(basename $loopdev)
 
 # expect partitions named like loop0p1 etc
@@ -27,5 +23,5 @@ for looppart in $(ls /dev/$base?*); do
 done
 
 # cleanup
-run_check $SUDO_HELPER losetup -d $loopdev
-run_check truncate -s0 img
+cleanup_loop_dev img
+rm img
