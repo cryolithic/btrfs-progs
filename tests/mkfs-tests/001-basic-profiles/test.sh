@@ -47,6 +47,16 @@ test_mkfs_single  -d  dup     -m  single
 test_mkfs_single  -d  dup     -m  dup
 test_mkfs_single  -d  dup     -m  dup     --mixed
 
+test_mkfs_single -Q
+test_mkfs_single -Q -d  single  -m  single
+test_mkfs_single -Q -d  single  -m  single  --mixed
+test_mkfs_single -Q -d  single  -m  dup
+test_mkfs_single -Q -d  dup     -m  single
+test_mkfs_single -Q -d  dup     -m  dup
+test_mkfs_single -Q -d  dup     -m  dup     --mixed
+
+# Profile doesn't really affect quota, skip them to save some time
+
 test_mkfs_multi
 test_mkfs_multi   -d  single  -m  single
 test_mkfs_multi   -d  single  -m  single  --mixed
