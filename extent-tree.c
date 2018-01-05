@@ -1910,15 +1910,9 @@ static int do_chunk_alloc(struct btrfs_trans_handle *trans,
 	                        space_info->flags, false);
 	if (ret == -ENOSPC) {
 		space_info->full = 1;
-		return 0;
+		return ret;
 	}
-
-	BUG_ON(ret);
-
-	ret = btrfs_make_block_group(trans, fs_info, 0, space_info->flags,
-				     start, num_bytes);
-	BUG_ON(ret);
-	return 0;
+	return ret;
 }
 
 static int update_block_group(struct btrfs_trans_handle *trans,

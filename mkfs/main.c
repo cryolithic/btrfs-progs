@@ -99,12 +99,6 @@ static int create_metadata_block_groups(struct btrfs_root *root, int mixed,
 		}
 		if (ret)
 			return ret;
-		ret = btrfs_make_block_group(trans, fs_info, 0,
-					     BTRFS_BLOCK_GROUP_METADATA |
-					     BTRFS_BLOCK_GROUP_DATA,
-					     chunk_start, chunk_size);
-		if (ret)
-			return ret;
 		allocation->mixed += chunk_size;
 	} else {
 		ret = btrfs_alloc_chunk(trans, fs_info,
@@ -116,12 +110,7 @@ static int create_metadata_block_groups(struct btrfs_root *root, int mixed,
 		}
 		if (ret)
 			return ret;
-		ret = btrfs_make_block_group(trans, fs_info, 0,
-					     BTRFS_BLOCK_GROUP_METADATA,
-					     chunk_start, chunk_size);
 		allocation->metadata += chunk_size;
-		if (ret)
-			return ret;
 	}
 
 	root->fs_info->system_allocs = 0;
@@ -150,12 +139,7 @@ static int create_data_block_groups(struct btrfs_trans_handle *trans,
 		}
 		if (ret)
 			return ret;
-		ret = btrfs_make_block_group(trans, fs_info, 0,
-					     BTRFS_BLOCK_GROUP_DATA,
-					     chunk_start, chunk_size);
 		allocation->data += chunk_size;
-		if (ret)
-			return ret;
 	}
 
 err:
@@ -258,9 +242,6 @@ static int create_one_raid_group(struct btrfs_trans_handle *trans,
 	}
 	if (ret)
 		return ret;
-
-	ret = btrfs_make_block_group(trans, fs_info, 0,
-				     type, chunk_start, chunk_size);
 
 	type &= BTRFS_BLOCK_GROUP_TYPE_MASK;
 	if (type == BTRFS_BLOCK_GROUP_DATA) {
@@ -1006,12 +987,7 @@ static int create_chunks(struct btrfs_trans_handle *trans,
 				&chunk_start, &chunk_size, meta_type, false);
 		if (ret)
 			return ret;
-		ret = btrfs_make_block_group(trans, fs_info, 0,
-					     meta_type, chunk_start,
-					     chunk_size);
 		allocation->metadata += chunk_size;
-		if (ret)
-			return ret;
 		set_extent_dirty(&root->fs_info->free_space_cache,
 				 chunk_start, chunk_start + chunk_size - 1);
 	}
@@ -1023,11 +999,7 @@ static int create_chunks(struct btrfs_trans_handle *trans,
 				&chunk_start, &size_of_data, data_type, false);
 	if (ret)
 		return ret;
-	ret = btrfs_make_block_group(trans, fs_info, 0,
-				     data_type, chunk_start, size_of_data);
 	allocation->data += size_of_data;
-	if (ret)
-		return ret;
 	set_extent_dirty(&root->fs_info->free_space_cache,
 			 chunk_start, chunk_start + size_of_data - 1);
 	return ret;

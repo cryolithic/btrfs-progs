@@ -845,10 +845,9 @@ error:
 				/ sizeof(struct btrfs_stripe) + 1)
 
 /*
- * Alloc a chunk, will insert dev extents, chunk item.
- * NOTE: This function will not insert block group item nor mark newly
- * allocated chunk available for later allocation.
- * Block group item and free space update is handled by btrfs_make_block_group()
+ * Alloc a chunk, will insert dev extents, chunk item, and insert new
+ * block group and update space info (so that extent allocator can use
+ * newly allocated chunk).
  *
  * @start:	return value of allocated chunk start bytenr.
  * @num_bytes:	return value of allocated chunk size
@@ -1167,6 +1166,9 @@ alloc_chunk:
 	}
 
 	kfree(chunk);
+
+	ret = btrfs_make_block_group(trans, info, 0, type, map->ce.start,
+				     map->ce.size);
 	return ret;
 
 out_chunk_map:
