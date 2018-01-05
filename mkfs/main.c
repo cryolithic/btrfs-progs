@@ -92,7 +92,7 @@ static int create_metadata_block_groups(struct btrfs_root *root, int mixed,
 		ret = btrfs_alloc_chunk(trans, fs_info,
 					&chunk_start, &chunk_size,
 					BTRFS_BLOCK_GROUP_METADATA |
-					BTRFS_BLOCK_GROUP_DATA);
+					BTRFS_BLOCK_GROUP_DATA, false);
 		if (ret == -ENOSPC) {
 			error("no space to allocate data/metadata chunk");
 			goto err;
@@ -109,7 +109,7 @@ static int create_metadata_block_groups(struct btrfs_root *root, int mixed,
 	} else {
 		ret = btrfs_alloc_chunk(trans, fs_info,
 					&chunk_start, &chunk_size,
-					BTRFS_BLOCK_GROUP_METADATA);
+					BTRFS_BLOCK_GROUP_METADATA, false);
 		if (ret == -ENOSPC) {
 			error("no space to allocate metadata chunk");
 			goto err;
@@ -143,7 +143,7 @@ static int create_data_block_groups(struct btrfs_trans_handle *trans,
 	if (!mixed) {
 		ret = btrfs_alloc_chunk(trans, fs_info,
 					&chunk_start, &chunk_size,
-					BTRFS_BLOCK_GROUP_DATA);
+					BTRFS_BLOCK_GROUP_DATA, false);
 		if (ret == -ENOSPC) {
 			error("no space to allocate data chunk");
 			goto err;
@@ -251,7 +251,7 @@ static int create_one_raid_group(struct btrfs_trans_handle *trans,
 	int ret;
 
 	ret = btrfs_alloc_chunk(trans, fs_info,
-				&chunk_start, &chunk_size, type);
+				&chunk_start, &chunk_size, type, false);
 	if (ret == -ENOSPC) {
 		error("not enough free space to allocate chunk");
 		exit(1);
@@ -1003,7 +1003,7 @@ static int create_chunks(struct btrfs_trans_handle *trans,
 
 	for (i = 0; i < num_of_meta_chunks; i++) {
 		ret = btrfs_alloc_chunk(trans, fs_info,
-					&chunk_start, &chunk_size, meta_type);
+				&chunk_start, &chunk_size, meta_type, false);
 		if (ret)
 			return ret;
 		ret = btrfs_make_block_group(trans, fs_info, 0,
@@ -1019,8 +1019,8 @@ static int create_chunks(struct btrfs_trans_handle *trans,
 	if (size_of_data < minimum_data_chunk_size)
 		size_of_data = minimum_data_chunk_size;
 
-	ret = btrfs_alloc_data_chunk(trans, fs_info,
-				     &chunk_start, size_of_data, data_type, 0);
+	ret = btrfs_alloc_chunk(trans, fs_info,
+				&chunk_start, &size_of_data, data_type, false);
 	if (ret)
 		return ret;
 	ret = btrfs_make_block_group(trans, fs_info, 0,

@@ -208,10 +208,7 @@ int btrfs_read_sys_array(struct btrfs_fs_info *fs_info);
 int btrfs_read_chunk_tree(struct btrfs_fs_info *fs_info);
 int btrfs_alloc_chunk(struct btrfs_trans_handle *trans,
 		      struct btrfs_fs_info *fs_info, u64 *start,
-		      u64 *num_bytes, u64 type);
-int btrfs_alloc_data_chunk(struct btrfs_trans_handle *trans,
-			   struct btrfs_fs_info *fs_info, u64 *start,
-			   u64 num_bytes, u64 type, int convert);
+		      u64 *num_bytes, u64 type, bool convert);
 int btrfs_open_devices(struct btrfs_fs_devices *fs_devices,
 		       int flags);
 int btrfs_close_devices(struct btrfs_fs_devices *fs_devices);
