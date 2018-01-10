@@ -1907,7 +1907,7 @@ static int do_chunk_alloc(struct btrfs_trans_handle *trans,
 		return 0;
 
 	ret = btrfs_alloc_chunk(trans, fs_info, &start, &num_bytes,
-	                        space_info->flags, false);
+	                        flags, false);
 	if (ret == -ENOSPC) {
 		space_info->full = 1;
 		return ret;
@@ -2652,8 +2652,11 @@ int btrfs_reserve_extent(struct btrfs_trans_handle *trans,
 	u64 search_start = 0;
 	u64 alloc_profile;
 	u64 profile;
+	u64 meta_profile;
 	struct btrfs_fs_info *info = root->fs_info;
 
+	meta_profile = info->avail_metadata_alloc_bits &
+		       info->metadata_alloc_profile;
 	if (is_data) {
 		alloc_profile = info->avail_data_alloc_bits &
 			        info->data_alloc_profile;
@@ -2663,21 +2666,57 @@ int btrfs_reserve_extent(struct btrfs_trans_handle *trans,
 			        info->system_alloc_profile;
 		profile = BTRFS_BLOCK_GROUP_SYSTEM | alloc_profile;
 	} else {
-		alloc_profile = info->avail_metadata_alloc_bits &
-			        info->metadata_alloc_profile;
+		alloc_profile = meta_profile;
 		profile = BTRFS_BLOCK_GROUP_METADATA | alloc_profile;
 	}
 
+	/*
+	 * If we're modifying global trees likes extent/root/device tree
+	 * (whose ref_cows is 0), we shouldn't trigger chunk allocation AT ALL!
+	 *
+	 * The problem is, if root is extent tree, we trigger a chunk
+	 * allocation, then it will modify extent tree, causing a path deadlock.
+	 * (Although not implemented in btrfs-progs, it will still cause tree
+	 * modification screwed up)
+	 */
 	if (root->ref_cows) {
+		u64 meta_reserve;
+
 		if (!(profile & BTRFS_BLOCK_GROUP_METADATA)) {
-			ret = do_chunk_alloc(trans, info,
-					     num_bytes,
-					     BTRFS_BLOCK_GROUP_METADATA);
-			BUG_ON(ret);
+			/*
+			 * If we're modifying fs trees and allocating data
+			 * extent, we need to ensure we have enough metadata
+			 * space to insert new file extent item.
+			 *
+			 * Here we need to ensure we have enough space for the
+			 * following operations:
+			 * 1) Insert one file extent
+			 *    A full tree CoW + Leaf split should be enough.
+			 *
+			 * 2) Possible new chunk allocation
+			 *    4 trees are involved, chunk, device, extent and
+			 *    root tree.
+			 *    However chunk tree is counted as system chunk, and
+			 *    never
+			 *    really needs a new system chunk even for super
+			 *    large fs.
+			 *    Only 3 trees are need.
+			 *
+			 * So it's total 4 trees, subvolume, extent, device and
+			 * root tree.
+			 * Each tree needs a full tree CoW + Leaf split.
+			 */
+			meta_reserve = 4 * ( BTRFS_MAX_LEVEL + 1) *
+				       info->nodesize;
+			ret = do_chunk_alloc(trans, info, meta_reserve,
+				meta_profile | BTRFS_BLOCK_GROUP_METADATA);
 		}
+
+		/* Keep 2M as free space headroom */
 		ret = do_chunk_alloc(trans, info,
 				     num_bytes + SZ_2M, profile);
-		BUG_ON(ret);
+		if (ret < 0)
+			return ret;
 	}
 
 	WARN_ON(num_bytes < info->sectorsize);
