@@ -73,7 +73,8 @@ static int update_cowonly_root(struct btrfs_trans_handle *trans,
 		ret = btrfs_update_root(trans, tree_root,
 					&root->root_key,
 					&root->root_item);
-		BUG_ON(ret);
+		if (ret < 0)
+			return ret;
 		btrfs_write_dirty_block_groups(trans, root);
 	}
 	return 0;
@@ -101,9 +102,11 @@ int commit_tree_roots(struct btrfs_trans_handle *trans,
 		next = fs_info->dirty_cowonly_roots.next;
 		list_del_init(next);
 		root = list_entry(next, struct btrfs_root, dirty_list);
-		update_cowonly_root(trans, root);
+		ret = update_cowonly_root(trans, root);
 		free_extent_buffer(root->commit_root);
 		root->commit_root = NULL;
+		if (ret < 0)
+			return ret;
 	}
 
 	return 0;
@@ -162,12 +165,15 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans,
 	root->root_item.level = btrfs_header_level(root->node);
 	ret = btrfs_update_root(trans, root->fs_info->tree_root,
 				&root->root_key, &root->root_item);
-	BUG_ON(ret);
+	if (ret < 0)
+		goto out;
 commit_tree:
 	ret = commit_tree_roots(trans, fs_info);
-	BUG_ON(ret);
+	if (ret < 0)
+		goto out;
 	ret = __commit_transaction(trans, root);
-	BUG_ON(ret);
+	if (ret < 0)
+		goto out;
 	write_ctree_super(trans);
 	btrfs_finish_extent_commit(trans, fs_info->extent_root,
 			           &fs_info->pinned_extents);
@@ -176,7 +182,8 @@ commit_tree:
 	root->commit_root = NULL;
 	fs_info->running_transaction = NULL;
 	fs_info->last_trans_committed = transid;
-	return 0;
+out:
+	return ret;
 }
 
 void btrfs_abort_transaction(struct btrfs_trans_handle *trans, int error)
