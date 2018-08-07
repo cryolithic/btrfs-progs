@@ -81,6 +81,11 @@ updating the metadata blocks.
 +
 NOTE: versions up to 3.11 set the nodesize to 4k.
 
+*-Q|--quota*::
+Enable btrfs quota support. Result filesystem will have quota enabled and all
+qgroup accounting correct.
+See also `btrfs-quota`(8).
+
 *-s|--sectorsize <size>*::
 Specify the sectorsize, the minimum data block allocation unit.
 +

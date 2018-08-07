@@ -860,6 +860,7 @@ int main(int argc, char **argv)
 	char *source_dir = NULL;
 	bool source_dir_set = false;
 	bool shrink_rootdir = false;
+	bool enable_quota = false;
 	u64 source_dir_size = 0;
 	u64 min_dev_size;
 	u64 shrink_size;
@@ -889,13 +890,14 @@ int main(int argc, char **argv)
 			{ "nodiscard", no_argument, NULL, 'K' },
 			{ "features", required_argument, NULL, 'O' },
 			{ "uuid", required_argument, NULL, 'U' },
+			{ "quota", required_argument, NULL, 'Q' },
 			{ "quiet", 0, NULL, 'q' },
 			{ "shrink", no_argument, NULL, GETOPT_VAL_SHRINK },
 			{ "help", no_argument, NULL, GETOPT_VAL_HELP },
 			{ NULL, 0, NULL, 0}
 		};
 
-		c = getopt_long(argc, argv, "A:b:fl:n:s:m:d:L:O:r:U:VMKq",
+		c = getopt_long(argc, argv, "A:b:fl:n:s:m:d:L:O:r:U:VMKqQ",
 				long_options, NULL);
 		if (c < 0)
 			break;
@@ -969,6 +971,9 @@ int main(int argc, char **argv)
 				break;
 			case 'q':
 				verbose = 0;
+				break;
+			case 'Q':
+				enable_quota = true;
 				break;
 			case GETOPT_VAL_SHRINK:
 				shrink_rootdir = true;
@@ -1360,6 +1365,15 @@ raid_groups:
 					ret);
 				goto out;
 			}
+		}
+	}
+
+	if (enable_quota) {
+		ret = setup_quota_root(fs_info);
+		if (ret < 0) {
+			error("failed to initialize quota: %d (%s)", ret,
+				strerror(-ret));
+			goto out;
 		}
 	}
 
