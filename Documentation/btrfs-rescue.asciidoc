@@ -31,6 +31,12 @@ help.
 NOTE: Since *chunk-recover* will scan the whole device, it will be *VERY* slow
 especially executed on a large device.
 
+*disable-quota* <device>::
+disable quota offline
++
+Acts as a fallback method to disable quota for case where mount hangs due to
+balance and quota.
+
 *fix-device-size* <device>::
 fix device size and super block total bytes values that are do not match
 +

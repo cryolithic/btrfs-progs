@@ -250,6 +250,84 @@ out:
 	return !!ret;
 }
 
+static const char * const cmd_rescue_disable_quota_usage[] = {
+	"btrfs rescue disable-quota <device>",
+	"Disable quota, especially useful for balance mount hang when quota enabled",
+	"",
+	NULL
+};
+
+static int cmd_rescue_disable_quota(int argc, char **argv)
+{
+	struct btrfs_trans_handle *trans;
+	struct btrfs_fs_info *fs_info;
+	struct btrfs_path path;
+	struct btrfs_root *root;
+	struct btrfs_qgroup_status_item *qi;
+	struct btrfs_key key;
+	char *devname;
+	int ret;
+
+	clean_args_no_options(argc, argv, cmd_rescue_disable_quota_usage);
+	if (check_argc_exact(argc, 2))
+		usage(cmd_rescue_disable_quota_usage);
+
+	devname = argv[optind];
+	ret = check_mounted(devname);
+	if (ret < 0) {
+		error("could not check mount status: %s", strerror(-ret));
+		return !!ret;
+	} else if (ret) {
+		error("%s is currently mounted", devname);
+		return !!ret;
+	}
+	fs_info = open_ctree_fs_info(devname, 0, 0, 0, OPEN_CTREE_WRITES);
+	if (!fs_info) {
+		error("could not open btrfs");
+		ret = -EIO;
+		return !!ret;
+	}
+	root = fs_info->quota_root;
+	if (!root) {
+		printf("Quota is not enabled, no need to modify the fs\n");
+		goto close;
+	}
+	btrfs_init_path(&path);
+	trans = btrfs_start_transaction(root, 1);
+	if (IS_ERR(trans)) {
+		ret = PTR_ERR(trans);
+		error("failed to start transaction: %s", strerror(-ret));
+		goto close;
+	}
+	key.objectid = 0;
+	key.type = BTRFS_QGROUP_STATUS_KEY;
+	key.offset = 0;
+	ret = btrfs_search_slot(trans, root, &key, &path, 0, 1);
+	if (ret < 0) {
+		error("failed to search tree: %s", strerror(-ret));
+		goto close;
+	}
+	if (ret > 0) {
+		printf(
+		"qgroup status item not found, not need to modify the fs");
+		ret = 0;
+		goto release;
+	}
+	qi = btrfs_item_ptr(path.nodes[0], path.slots[0],
+			    struct btrfs_qgroup_status_item);
+	btrfs_set_qgroup_status_flags(path.nodes[0], qi,
+			BTRFS_QGROUP_STATUS_FLAG_INCONSISTENT);
+	btrfs_mark_buffer_dirty(path.nodes[0]);
+	ret = btrfs_commit_transaction(trans, root);
+	if (ret < 0)
+		error("failed to commit transaction: %s", strerror(-ret));
+release:
+	btrfs_release_path(&path);
+close:
+	close_ctree(fs_info->tree_root);
+	return !!ret;
+}
+
 static const char rescue_cmd_group_info[] =
 "toolbox for specific rescue operations";
 
@@ -262,6 +340,8 @@ const struct cmd_group rescue_cmd_group = {
 		{ "zero-log", cmd_rescue_zero_log, cmd_rescue_zero_log_usage, NULL, 0},
 		{ "fix-device-size", cmd_rescue_fix_device_size,
 			cmd_rescue_fix_device_size_usage, NULL, 0},
+		{ "disable-quota", cmd_rescue_disable_quota,
+			cmd_rescue_disable_quota_usage, NULL, 0},
 		NULL_CMD_STRUCT
 	}
 };
