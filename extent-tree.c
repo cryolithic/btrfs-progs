@@ -2652,7 +2652,7 @@ int btrfs_reserve_extent(struct btrfs_trans_handle *trans,
 		profile = BTRFS_BLOCK_GROUP_METADATA | alloc_profile;
 	}
 
-	if (root->ref_cows) {
+	if (root->objectid != BTRFS_EXTENT_TREE_OBJECTID) {
 		if (!(profile & BTRFS_BLOCK_GROUP_METADATA)) {
 			ret = do_chunk_alloc(trans, info,
 					     num_bytes,
