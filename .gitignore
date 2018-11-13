@@ -67,6 +67,7 @@
 
 /Documentation/Makefile
 /Documentation/*.html
+/Documentation/*.gz
 /Documentation/btrfs-balance.8
 /Documentation/btrfs-check.8
 /Documentation/btrfs-convert.8
