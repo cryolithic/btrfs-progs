@@ -75,4 +75,7 @@ int test_num_disk_vs_raid(u64 metadata_profile, u64 data_profile,
 int test_status_for_mkfs(const char *file, bool force_overwrite);
 int test_dev_for_mkfs(const char *file, int force_overwrite);
 
+int create_uuid_tree(struct btrfs_trans_handle *trans);
+int create_inode_tree(struct btrfs_trans_handle *trans, u64 objectid);
+
 #endif

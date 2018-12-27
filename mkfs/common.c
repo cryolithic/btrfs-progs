@@ -23,6 +23,7 @@
 #include "disk-io.h"
 #include "volumes.h"
 #include "utils.h"
+#include "transaction.h"
 #include "mkfs/common.h"
 
 static u64 reference_root_table[] = {
@@ -822,4 +823,106 @@ int test_minimum_size(const char *file, u64 min_dev_size)
 	return 0;
 }
 
+/*
+ * Create a tree with all its content copied from @source
+ *
+ * Caller must ensure @source only has one leaf.
+ */
+static int __create_tree(struct btrfs_trans_handle *trans,
+			 struct btrfs_root *root, u64 objectid)
+{
+	struct btrfs_fs_info *fs_info = trans->fs_info;
+	struct btrfs_key location;
+	struct btrfs_root_item root_item;
+	struct extent_buffer *tmp;
+	u8 uuid[BTRFS_UUID_SIZE] = {0};
+	int ret;
 
+	ASSERT(btrfs_header_level(root->node) == 0);
+
+	ret = btrfs_copy_root(trans, root, root->node, &tmp, objectid);
+	if (ret)
+		return ret;
+
+	memcpy(&root_item, &root->root_item, sizeof(root_item));
+	btrfs_set_root_bytenr(&root_item, tmp->start);
+	btrfs_set_root_level(&root_item, btrfs_header_level(tmp));
+	btrfs_set_root_generation(&root_item, trans->transid);
+	/* clear uuid and o/ctime of source tree */
+	memcpy(root_item.uuid, uuid, BTRFS_UUID_SIZE);
+	btrfs_set_stack_timespec_sec(&root_item.otime, 0);
+	btrfs_set_stack_timespec_sec(&root_item.ctime, 0);
+	free_extent_buffer(tmp);
+
+	location.objectid = objectid;
+	location.type = BTRFS_ROOT_ITEM_KEY;
+	location.offset = 0;
+	ret = btrfs_insert_root(trans, fs_info->tree_root,
+				&location, &root_item);
+
+	return ret;
+}
+
+/*
+ * Create an *EMPTY* tree
+ *
+ * Caller must ensure at the time of calling, csum tree is still empty
+ */
+static int create_empty_tree(struct btrfs_trans_handle *trans, u64 objectid)
+{
+	struct btrfs_root *csum_root = trans->fs_info->csum_root;
+
+	ASSERT(btrfs_header_level(csum_root->node) == 0 &&
+	       btrfs_header_nritems(csum_root->node) == 0);
+	return __create_tree(trans, csum_root, objectid);
+}
+
+/*
+ * Create a tree containing an root inode
+ *
+ * Caller must ensure at the time of calling, fs tree only contains 2 items
+ * (one for INODE_ITEM and one for INODE_REF)
+ */
+int create_inode_tree(struct btrfs_trans_handle *trans, u64 objectid)
+{
+	struct btrfs_root *fs_root = trans->fs_info->fs_root;
+
+	ASSERT(btrfs_header_level(fs_root->node) == 0 &&
+	       btrfs_header_nritems(fs_root->node) == 2);
+	return __create_tree(trans, fs_root, objectid);
+}
+
+int create_uuid_tree(struct btrfs_trans_handle *trans)
+{
+	struct btrfs_fs_info *fs_info = trans->fs_info;
+	struct btrfs_root *uuid_root = fs_info->uuid_root;
+	struct btrfs_key key;
+	int ret;
+
+	if (!uuid_root) {
+		ret = create_empty_tree(trans, BTRFS_UUID_TREE_OBJECTID);
+		if (ret < 0) {
+			errno = -ret;
+			error("failed to create uuid root: %m");
+			return ret;
+		}
+		key.objectid = BTRFS_UUID_TREE_OBJECTID;
+		key.type = BTRFS_ROOT_ITEM_KEY;
+		key.offset = 0;
+		uuid_root = btrfs_read_fs_root_no_cache(fs_info, &key);
+		if (IS_ERR(uuid_root)) {
+			errno = -PTR_ERR(uuid_root);
+			error("failed to read uuid root: %m");
+			return PTR_ERR(uuid_root);
+		}
+		fs_info->uuid_root = uuid_root;
+	}
+	ret = btrfs_uuid_tree_add(trans, fs_info->fs_root->root_item.uuid,
+				  BTRFS_UUID_KEY_SUBVOL,
+				  fs_info->fs_root->root_key.objectid);
+	if (ret < 0) {
+		errno = -ret;
+		error("failed to add uuid tree entry for fs root: %m");
+	}
+	return ret;
+}

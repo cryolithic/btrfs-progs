@@ -709,6 +709,8 @@ void btrfs_free_fs_info(struct btrfs_fs_info *fs_info)
 {
 	if (fs_info->quota_root)
 		free(fs_info->quota_root);
+	if (fs_info->uuid_root)
+		free(fs_info->uuid_root);
 
 	free(fs_info->tree_root);
 	free(fs_info->extent_root);
@@ -979,6 +981,8 @@ void btrfs_release_all_roots(struct btrfs_fs_info *fs_info)
 		free_extent_buffer(fs_info->log_root_tree->node);
 	if (fs_info->chunk_root)
 		free_extent_buffer(fs_info->chunk_root->node);
+	if (fs_info->uuid_root)
+		free_extent_buffer(fs_info->uuid_root->node);
 }
 
 static void free_map_lookup(struct cache_extent *ce)
