@@ -205,6 +205,7 @@ commit_tree:
 	root->commit_root = NULL;
 	fs_info->running_transaction = NULL;
 	fs_info->last_trans_committed = transid;
+	fs_info->convert_to_bg_tree = 0;
 out:
 	return ret;
 }

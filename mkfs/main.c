@@ -677,6 +677,54 @@ static void update_chunk_allocation(struct btrfs_fs_info *fs_info,
 	}
 }
 
+/* Helper to convert to bg_tree feature */
+static int convert_to_bg_tree(struct btrfs_trans_handle *trans)
+{
+	struct btrfs_fs_info *fs_info = trans->fs_info;
+	struct btrfs_block_group_cache *bg;
+	struct btrfs_root *bg_root;
+	struct btrfs_key key;
+	u64 features = btrfs_super_incompat_flags(fs_info->super_copy);
+	int ret;
+
+	/* create bg tree first */
+	ret = create_empty_tree(trans, BTRFS_BLOCK_GROUP_TREE_OBJECTID);
+	if (ret < 0) {
+		errno = -ret;
+		error("failed to create bg tree: %m");
+		return ret;
+	}
+	key.objectid = BTRFS_BLOCK_GROUP_TREE_OBJECTID;
+	key.type = BTRFS_ROOT_ITEM_KEY;
+	key.offset = 0;
+	bg_root = btrfs_read_fs_root_no_cache(fs_info, &key);
+	if (IS_ERR(bg_root)) {
+		errno = -PTR_ERR(bg_root);
+		error("failed to read bg root: %m");
+		return PTR_ERR(bg_root);
+	}
+	fs_info->bg_root = bg_root;
+	fs_info->bg_root->track_dirty = 1;
+	fs_info->bg_root->ref_cows = 0;
+
+	/* set BG_TREE feature and mark the fs into bg_tree convert status */
+	btrfs_set_super_incompat_flags(fs_info->super_copy,
+			features | BTRFS_FEATURE_INCOMPAT_BG_TREE);
+	fs_info->convert_to_bg_tree = 1;
+
+	/*
+	 * Mark all block groups dirty so they will get converted to bg tree at
+	 * commit transaction time
+	 */
+	for (bg = btrfs_lookup_first_block_group(fs_info, 0); bg;
+	     bg = btrfs_lookup_first_block_group(fs_info,
+				bg->key.objectid + bg->key.offset))
+		set_extent_bits(&fs_info->block_group_cache, bg->key.objectid,
+				bg->key.objectid + bg->key.offset - 1,
+				BLOCK_GROUP_DIRTY);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	char *file;
@@ -1182,6 +1230,15 @@ raid_groups:
 		warning(
 	"unable to create uuid tree, will be created after mount: %d", ret);
 
+	/* Bg tree are converted after the fs is created */
+	if (mkfs_cfg.features & BTRFS_FEATURE_INCOMPAT_BG_TREE) {
+		ret = convert_to_bg_tree(trans);
+		if (ret < 0) {
+			errno = -ret;
+			error(
+		"bg-tree feature will not be enabled, due to error: %m");
+		}
+	}
 	ret = btrfs_commit_transaction(trans, root);
 	if (ret) {
 		error("unable to commit transaction: %d", ret);
