@@ -1109,6 +1109,55 @@ static struct btrfs_root *open_root(struct btrfs_fs_info *fs_info,
 
 	return root;
 }
+
+static int dirty_fix(struct btrfs_fs_info *fs_info)
+{
+	struct extent_buffer *eb;
+	struct btrfs_key key;
+	struct btrfs_disk_key disk_key;
+	u64 culprit_leaf_start = 57567265079296;
+	u64 bad_key_objectid = 18446726481523507189;
+	u64 key_offset = 57709742260224;
+	int bad_slot = 83;
+	int ret = 0;
+
+	eb = read_tree_block(fs_info, culprit_leaf_start, 0);
+	if (!extent_buffer_uptodate(eb)) {
+		error("failed to read tree block %llu", culprit_leaf_start);
+		return EIO;
+	}
+	if (btrfs_header_level(eb) != 0) {
+		ret = -ENOENT;
+		error("tree block %llu isn't a leaf, has level %d expect %d",
+				culprit_leaf_start, btrfs_header_level(eb), 0);
+		goto out;
+	}
+	btrfs_item_key_to_cpu(eb, &key, bad_slot);
+	if (key.objectid != bad_key_objectid || key.offset != key_offset ||
+	    key.type != 0 ) {
+		error(
+	"leaf content doesn't match, has (%llu %u %llu) expect (%llu %u %llu)",
+			key.objectid, key.type, key.offset,
+			bad_key_objectid, BTRFS_METADATA_ITEM_KEY, 0ULL);
+		ret = -ENOENT;
+		goto out;
+	}
+	key.objectid = BTRFS_FREE_SPACE_OBJECTID;
+	btrfs_cpu_key_to_disk(&disk_key, &key);
+	btrfs_set_item_key(eb, &disk_key, bad_slot);
+
+	ret = write_tree_block(NULL, fs_info, eb);
+	if (ret < 0) {
+		errno = -ret;
+		error("failed to write tree block %llu: %m", culprit_leaf_start);
+	} else {
+		printf("The corrupted leaf should be fixed now\n");
+	}
+out:
+	free_extent_buffer(eb);
+	return ret;
+}
+
 int main(int argc, char **argv)
 {
 	struct cache_tree root_cache;
@@ -1135,6 +1184,7 @@ int main(int argc, char **argv)
 	u64 root_objectid = 0;
 	u64 csum_bytenr = 0;
 	char field[FIELD_BUF_LEN];
+	bool do_dirty_fix = false;
 
 	field[0] = '\0';
 	memset(&key, 0, sizeof(key));
@@ -1165,7 +1215,7 @@ int main(int argc, char **argv)
 			{ NULL, 0, NULL, 0 }
 		};
 
-		c = getopt_long(argc, argv, "l:c:b:eEkuUi:f:x:m:K:I:D:d:r:C:",
+		c = getopt_long(argc, argv, "l:c:b:eEkuUi:f:x:m:K:I:D:d:r:C:X",
 				long_options, NULL);
 		if (c < 0)
 			break;
@@ -1228,6 +1278,9 @@ int main(int argc, char **argv)
 			case 'C':
 				csum_bytenr = arg_strtou64(optarg);
 				break;
+			case 'X':
+				do_dirty_fix = true;
+				break;
 			case GETOPT_VAL_HELP:
 			default:
 				print_usage(c != GETOPT_VAL_HELP);
@@ -1245,6 +1298,10 @@ int main(int argc, char **argv)
 	if (!root) {
 		fprintf(stderr, "Open ctree failed\n");
 		exit(1);
+	}
+	if (do_dirty_fix) {
+		ret = dirty_fix(root->fs_info);
+		goto out_close;
 	}
 	target_root = root;
 	if (root_objectid)
