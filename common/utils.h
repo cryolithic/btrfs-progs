@@ -19,42 +19,20 @@
 #ifndef __BTRFS_UTILS_H__
 #define __BTRFS_UTILS_H__
 
+#include "kerncompat.h"
+#include <stdbool.h>
+#include <stddef.h>
 #include <sys/stat.h>
-#include "kernel-shared/ctree.h"
-#include <dirent.h>
-#include <stdarg.h>
-#include "common/defs.h"
-#include "common/internal.h"
-#include "btrfs-list.h"
-#include "kernel-lib/sizes.h"
-#include "common/messages.h"
-#include "ioctl.h"
+#include "kernel-lib/list.h"
+#include "kernel-shared/volumes.h"
 #include "common/fsfeatures.h"
 
-/*
- * Output modes of size
- */
-#define UNITS_RESERVED			(0)
-#define UNITS_BYTES			(1)
-#define UNITS_KBYTES			(2)
-#define UNITS_MBYTES			(3)
-#define UNITS_GBYTES			(4)
-#define UNITS_TBYTES			(5)
-#define UNITS_RAW			(1U << UNITS_MODE_SHIFT)
-#define UNITS_BINARY			(2U << UNITS_MODE_SHIFT)
-#define UNITS_DECIMAL			(3U << UNITS_MODE_SHIFT)
-/* Interpret the u64 value as s64 */
-#define UNITS_NEGATIVE			(4U << UNITS_MODE_SHIFT)
-#define UNITS_MODE_MASK			((1U << UNITS_MODE_SHIFT) - 1)
-#define UNITS_MODE_SHIFT		(8)
-#define UNITS_HUMAN_BINARY		(UNITS_BINARY)
-#define UNITS_HUMAN_DECIMAL		(UNITS_DECIMAL)
-#define UNITS_HUMAN			(UNITS_HUMAN_BINARY)
-#define UNITS_DEFAULT			(UNITS_HUMAN)
+struct list_head;
 
 enum exclusive_operation {
 	BTRFS_EXCLOP_NONE,
 	BTRFS_EXCLOP_BALANCE,
+	BTRFS_EXCLOP_BALANCE_PAUSED,
 	BTRFS_EXCLOP_DEV_ADD,
 	BTRFS_EXCLOP_DEV_REMOVE,
 	BTRFS_EXCLOP_DEV_REPLACE,
@@ -63,26 +41,24 @@ enum exclusive_operation {
 	BTRFS_EXCLOP_UNKNOWN = -1,
 };
 
-void units_set_mode(unsigned *units, unsigned mode);
-void units_set_base(unsigned *units, unsigned base);
+static inline u32 btrfs_type_to_imode(u8 type)
+{
+	static u32 imode_by_btrfs_type[] = {
+		[BTRFS_FT_REG_FILE]	= S_IFREG,
+		[BTRFS_FT_DIR]		= S_IFDIR,
+		[BTRFS_FT_CHRDEV]	= S_IFCHR,
+		[BTRFS_FT_BLKDEV]	= S_IFBLK,
+		[BTRFS_FT_FIFO]		= S_IFIFO,
+		[BTRFS_FT_SOCK]		= S_IFSOCK,
+		[BTRFS_FT_SYMLINK]	= S_IFLNK,
+	};
 
-int btrfs_make_root_dir(struct btrfs_trans_handle *trans,
-			struct btrfs_root *root, u64 objectid);
-int check_mounted(const char *devicename);
-int check_mounted_where(int fd, const char *file, char *where, int size,
-		struct btrfs_fs_devices **fs_devices_mnt, unsigned sbflags);
+	return imode_by_btrfs_type[(type)];
+}
 
-int pretty_size_snprintf(u64 size, char *str, size_t str_bytes, unsigned unit_mode);
-#define pretty_size(size) 	pretty_size_mode(size, UNITS_DEFAULT)
-const char *pretty_size_mode(u64 size, unsigned mode);
-
-enum btrfs_csum_type parse_csum_type(const char *s);
-u64 parse_size_from_string(const char *s);
-u64 parse_qgroupid(const char *p);
-u64 arg_strtou64(const char *str);
-int open_file_or_dir(const char *fname, DIR **dirstream);
-int open_file_or_dir3(const char *fname, DIR **dirstream, int open_flags);
-void close_file_or_dir(int fd, DIR *dirstream);
+/* 2 for "0x", 2 for each byte, plus nul */
+#define BTRFS_CSUM_STRING_LEN		(2 + 2 * BTRFS_CSUM_SIZE + 1)
+void btrfs_format_csum(u16 csum_type, const u8 *data, char *output);
 int get_fs_info(const char *path, struct btrfs_ioctl_fs_info_args *fi_args,
 		struct btrfs_ioctl_dev_info_args **di_ret);
 int get_fsid(const char *path, u8 *fsid, int silent);
@@ -91,28 +67,12 @@ int get_fs_exclop(int fd);
 int check_running_fs_exclop(int fd, enum exclusive_operation start, bool enqueue);
 const char *get_fs_exclop_name(int op);
 
-int get_label(const char *btrfs_dev, char *label);
-int set_label(const char *btrfs_dev, const char *label);
-
 int check_arg_type(const char *input);
-int open_path_or_dev_mnt(const char *path, DIR **dirstream, int verbose);
-int btrfs_open(const char *path, DIR **dirstream, int verbose, int dir_only);
-int btrfs_open_dir(const char *path, DIR **dirstream, int verbose);
-int btrfs_open_file_or_dir(const char *path, DIR **dirstream, int verbose);
-int get_label_mounted(const char *mount_path, char *labelp);
-int get_label_unmounted(const char *dev, char *label);
-int group_profile_max_safe_loss(u64 flags);
-int csum_tree_block(struct btrfs_fs_info *root, struct extent_buffer *buf,
-		    int verify);
 int ask_user(const char *question);
 int lookup_path_rootid(int fd, u64 *rootid);
-int get_btrfs_mount(const char *dev, char *mp, size_t mp_size);
 int find_mount_fsroot(const char *subvol, const char *subvolid, char **mount);
 int find_mount_root(const char *path, char **mount_root);
-int get_device_info(int fd, u64 devid,
-		struct btrfs_ioctl_dev_info_args *di_args);
 int get_df(int fd, struct btrfs_ioctl_space_args **sargs_ret);
-int test_uuid_unique(char *fs_uuid);
 
 const char *subvol_strip_mountpoint(const char *mnt, const char *full_path);
 int find_next_key(struct btrfs_path *path, struct btrfs_key *key);
@@ -121,12 +81,6 @@ const char* btrfs_group_profile_str(u64 flag);
 
 int count_digits(u64 num);
 u64 div_factor(u64 num, int factor);
-
-int btrfs_tree_search2_ioctl_supported(int fd);
-
-unsigned int get_unit_mode_from_arg(int *argc, char *argv[], int df_mode);
-int string_is_numerical(const char *str);
-int prefixcmp(const char *str, const char *prefix);
 
 unsigned long total_memory(void);
 
@@ -149,12 +103,26 @@ struct btrfs_config {
 	 *   > 0: verbose level
 	 */
 	int verbose;
+	/* Command line request to skip any modification actions. */
+	int dry_run;
+	struct list_head params;
 };
 extern struct btrfs_config bconf;
+
+struct config_param {
+	struct list_head list;
+	const char *key;
+	const char *value;
+};
 
 void btrfs_config_init(void);
 void bconf_be_verbose(void);
 void bconf_be_quiet(void);
+void bconf_add_param(const char *key, const char *value);
+void bconf_save_param(const char *str);
+void bconf_set_dry_run(void);
+bool bconf_is_dry_run(void);
+const char *bconf_param_value(const char *key);
 
 /* Pseudo random number generator wrappers */
 int rand_int(void);
@@ -165,10 +133,40 @@ u64 rand_u64(void);
 unsigned int rand_range(unsigned int upper);
 void init_rand_seed(u64 seed);
 
+bool get_env_bool(const char *env_name);
+
 char *btrfs_test_for_multiple_profiles(int fd);
 int btrfs_warn_multiple_profiles(int fd);
+void btrfs_warn_experimental(const char *str);
 
-int sysfs_open_fsid_file(int fd, const char *filename);
-int sysfs_read_file(int fd, char *buf, size_t size);
+/* An error code to error string mapping for the kernel error codes */
+static inline char *btrfs_err_str(enum btrfs_err_code err_code)
+{
+	switch (err_code) {
+	case BTRFS_ERROR_DEV_RAID1_MIN_NOT_MET:
+		return "unable to go below two devices on raid1";
+	case BTRFS_ERROR_DEV_RAID1C3_MIN_NOT_MET:
+		return "unable to go below three devices on raid1c3";
+	case BTRFS_ERROR_DEV_RAID1C4_MIN_NOT_MET:
+		return "unable to go below four devices on raid1c4";
+	case BTRFS_ERROR_DEV_RAID10_MIN_NOT_MET:
+		return "unable to go below four/two devices on raid10";
+	case BTRFS_ERROR_DEV_RAID5_MIN_NOT_MET:
+		return "unable to go below two devices on raid5";
+	case BTRFS_ERROR_DEV_RAID6_MIN_NOT_MET:
+		return "unable to go below three devices on raid6";
+	case BTRFS_ERROR_DEV_TGT_REPLACE:
+		return "unable to remove the dev_replace target dev";
+	case BTRFS_ERROR_DEV_MISSING_NOT_FOUND:
+		return "no missing devices found to remove";
+	case BTRFS_ERROR_DEV_ONLY_WRITABLE:
+		return "unable to remove the only writeable device";
+	case BTRFS_ERROR_DEV_EXCL_RUN_IN_PROGRESS:
+		return "add/delete/balance/replace/resize operation "
+			"in progress";
+	default:
+		return NULL;
+	}
+}
 
 #endif

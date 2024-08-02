@@ -5,7 +5,7 @@
  *
  * libbtrfsutil is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Lesser General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
+ * the Free Software Foundation, either version 2.1 of the License, or
  * (at your option) any later version.
  *
  * libbtrfsutil is distributed in the hope that it will be useful,
@@ -17,9 +17,9 @@
  * along with libbtrfsutil.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <errno.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <fcntl.h>
-#include <unistd.h>
 #include <sys/ioctl.h>
 
 #include "btrfsutil_internal.h"
@@ -37,6 +37,8 @@ PUBLIC enum btrfs_util_error btrfs_util_sync(const char *path)
 	SAVE_ERRNO_AND_CLOSE(fd);
 	return err;
 }
+PUBLIC enum btrfs_util_error btrfs_util_fs_sync(const char *path)
+LIBBTRFSUTIL_ALIAS(btrfs_util_sync);
 
 PUBLIC enum btrfs_util_error btrfs_util_sync_fd(int fd)
 {
@@ -48,6 +50,8 @@ PUBLIC enum btrfs_util_error btrfs_util_sync_fd(int fd)
 
 	return BTRFS_UTIL_OK;
 }
+PUBLIC enum btrfs_util_error btrfs_util_fs_sync_fd(int fd)
+LIBBTRFSUTIL_ALIAS(btrfs_util_sync_fd);
 
 PUBLIC enum btrfs_util_error btrfs_util_start_sync(const char *path,
 						   uint64_t *transid)
@@ -63,6 +67,8 @@ PUBLIC enum btrfs_util_error btrfs_util_start_sync(const char *path,
 	SAVE_ERRNO_AND_CLOSE(fd);
 	return err;
 }
+PUBLIC enum btrfs_util_error btrfs_util_fs_start_sync(const char *path, uint64_t *transid)
+LIBBTRFSUTIL_ALIAS(btrfs_util_start_sync);
 
 PUBLIC enum btrfs_util_error btrfs_util_start_sync_fd(int fd, uint64_t *transid)
 {
@@ -74,6 +80,8 @@ PUBLIC enum btrfs_util_error btrfs_util_start_sync_fd(int fd, uint64_t *transid)
 
 	return BTRFS_UTIL_OK;
 }
+PUBLIC enum btrfs_util_error btrfs_util_fs_start_sync_fd(int fd, uint64_t *transid)
+LIBBTRFSUTIL_ALIAS(btrfs_util_start_sync_fd);
 
 PUBLIC enum btrfs_util_error btrfs_util_wait_sync(const char *path,
 						  uint64_t transid)
@@ -89,6 +97,8 @@ PUBLIC enum btrfs_util_error btrfs_util_wait_sync(const char *path,
 	SAVE_ERRNO_AND_CLOSE(fd);
 	return err;
 }
+PUBLIC enum btrfs_util_error btrfs_util_fs_wait_sync(const char *path, uint64_t transid)
+LIBBTRFSUTIL_ALIAS(btrfs_util_wait_sync);
 
 PUBLIC enum btrfs_util_error btrfs_util_wait_sync_fd(int fd, uint64_t transid)
 {
@@ -100,3 +110,5 @@ PUBLIC enum btrfs_util_error btrfs_util_wait_sync_fd(int fd, uint64_t transid)
 
 	return BTRFS_UTIL_OK;
 }
+PUBLIC enum btrfs_util_error btrfs_util_fs_wait_sync_fd(int fd, uint64_t transid)
+LIBBTRFSUTIL_ALIAS(btrfs_util_wait_sync_fd);

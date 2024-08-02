@@ -5,12 +5,13 @@
 # There is a bug that makes mkfs.btrfs always to create unnecessary SINGLE
 # chunks, which eats up a lot of space and leads to unexpected ENOSPC bugs.
 
-source "$TEST_TOP/common"
+source "$TEST_TOP/common" || exit
 
 check_prereq mkfs.btrfs
+
 prepare_test_dev
 
-tmp=$(mktemp -d --tmpdir btrfs-progs-mkfs.rootdirXXXXXXX)
+tmp=$(_mktemp_dir mkfs-rootdir)
 
 fallocate -l 128M $tmp/large_file
 

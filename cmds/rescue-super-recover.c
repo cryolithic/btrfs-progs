@@ -16,24 +16,20 @@
  * Boston, MA 021110-1307, USA.
  */
 
+#include "kerncompat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
-#include <sys/stat.h>
-#include <uuid/uuid.h>
 #include <errno.h>
 #include <unistd.h>
-#include <ctype.h>
-#include <getopt.h>
-
-#include "kerncompat.h"
+#include <string.h>
+#include "kernel-lib/list.h"
+#include "kernel-shared/accessors.h"
+#include "kernel-shared/uapi/btrfs_tree.h"
 #include "kernel-shared/ctree.h"
 #include "kernel-shared/disk-io.h"
-#include "kernel-lib/list.h"
-#include "common/utils.h"
-#include "crypto/crc32c.h"
 #include "kernel-shared/volumes.h"
-#include "cmds/commands.h"
+#include "common/utils.h"
 #include "cmds/rescue.h"
 
 struct btrfs_recover_superblock {
@@ -114,9 +110,8 @@ static int
 read_dev_supers(char *filename, struct btrfs_recover_superblock *recover)
 {
 	int i, ret, fd;
-	u8 buf[BTRFS_SUPER_INFO_SIZE];
 	u64 max_gen, bytenr;
-	struct btrfs_super_block *sb = (struct btrfs_super_block *)buf;
+	struct btrfs_super_block sb;
 
 	/* just ignore errno that were set in btrfs_scan_fs_devices() */
 	errno = 0;
@@ -128,13 +123,13 @@ read_dev_supers(char *filename, struct btrfs_recover_superblock *recover)
 	for (i = 0; i < BTRFS_SUPER_MIRROR_MAX; i++) {
 		bytenr = btrfs_sb_offset(i);
 
-		ret = btrfs_read_dev_super(fd, sb, bytenr, SBREAD_DEFAULT);
+		ret = btrfs_read_dev_super(fd, &sb, bytenr, SBREAD_DEFAULT);
 		if (!ret) {
-			ret = add_superblock_record(sb, filename, bytenr,
+			ret = add_superblock_record(&sb, filename, bytenr,
 							&recover->good_supers);
 			if (ret)
 				goto out;
-			max_gen = btrfs_super_generation(sb);
+			max_gen = btrfs_super_generation(&sb);
 			if (max_gen > recover->max_generation)
 				recover->max_generation = max_gen;
 		} else if (ret != -ENOENT){
@@ -142,7 +137,7 @@ read_dev_supers(char *filename, struct btrfs_recover_superblock *recover)
 			 * Skip superblock which doesn't exist, only adds
 			 * really corrupted superblock
 			 */
-			ret = add_superblock_record(sb, filename, bytenr,
+			ret = add_superblock_record(&sb, filename, bytenr,
 						&recover->bad_supers);
 			if (ret)
 				goto out;

@@ -16,29 +16,30 @@
  * Boston, MA 021110-1307, USA.
  */
 
-#include <ctype.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <zlib.h>
-
 #include "kerncompat.h"
+#include <sys/time.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <stdbool.h>
+#include <unistd.h>
+#include "kernel-lib/rbtree.h"
+#include "kernel-lib/rbtree_types.h"
+#include "kernel-shared/accessors.h"
+#include "kernel-shared/uapi/btrfs_tree.h"
 #include "kernel-shared/ctree.h"
 #include "kernel-shared/disk-io.h"
-#include "kernel-shared/print-tree.h"
-#include "kernel-shared/transaction.h"
-#include "kernel-lib/list.h"
-#include "kernel-shared/volumes.h"
-#include "common/utils.h"
-#include "cmds/commands.h"
+#include "kernel-shared/extent_io.h"
+#include "kernel-shared/file-item.h"
+#include "kernel-shared/tree-checker.h"
 #include "common/help.h"
+#include "common/messages.h"
+#include "common/open-utils.h"
+#include "common/string-utils.h"
+#include "common/units.h"
+#include "cmds/commands.h"
 
 static int verbose = 0;
-static int no_pretty = 0;
 
 struct seek {
 	u64 distance;
@@ -119,8 +120,7 @@ static int walk_leaf(struct btrfs_root *root, struct btrfs_path *path,
 		fi = btrfs_item_ptr(b, i, struct btrfs_file_extent_item);
 		if (btrfs_file_extent_type(b, fi) == BTRFS_FILE_EXTENT_INLINE)
 			stat->total_inline +=
-				btrfs_file_extent_inline_item_len(b,
-							btrfs_item_nr(i));
+				btrfs_file_extent_inline_item_len(b, i);
 	}
 
 	return 0;
@@ -154,8 +154,12 @@ static int walk_nodes(struct btrfs_root *root, struct btrfs_path *path,
 
 		path->slots[level] = i;
 		if ((level - 1) > 0 || find_inline) {
-			tmp = read_tree_block(root->fs_info, cur_blocknr,
-					      btrfs_node_ptr_generation(b, i));
+			struct btrfs_tree_parent_check check = {
+				.owner_root = btrfs_header_owner(b),
+				.transid = btrfs_node_ptr_generation(b, i),
+				.level = level - 1,
+			};
+			tmp = read_tree_block(root->fs_info, cur_blocknr, &check);
 			if (!extent_buffer_uptodate(tmp)) {
 				error("failed to read blocknr %llu",
 					btrfs_node_blockptr(b, i));
@@ -177,8 +181,7 @@ static int walk_nodes(struct btrfs_root *root, struct btrfs_path *path,
 			if (stat->max_seek_len < distance)
 				stat->max_seek_len = distance;
 			if (add_seek(&stat->seek_root, distance)) {
-				error("cannot add new seek at distance %llu",
-						(unsigned long long)distance);
+				error("cannot add new seek at distance %llu", distance);
 				ret = -ENOMEM;
 				break;
 			}
@@ -234,7 +237,7 @@ static void print_seek_histogram(struct root_stats *stat)
 
 	/* Make a tick count as 5% of the total seeks */
 	tick_interval = stat->total_seeks / 20;
-	printf("\tSeek histogram\n");
+	pr_verbose(LOG_DEFAULT, "\tSeek histogram\n");
 	for (; n; n = rb_next(n)) {
 		u64 ticks, gticks = 0;
 
@@ -254,14 +257,14 @@ static void print_seek_histogram(struct root_stats *stat)
 		if (group_count) {
 
 			gticks = group_count / tick_interval;
-			printf("\t\t%*Lu - %*Lu: %*Lu ", digits, group_start,
+			pr_verbose(LOG_DEFAULT, "\t\t%*llu - %*llu: %*llu ", digits, group_start,
 			       digits, group_end, digits, group_count);
 			if (gticks) {
 				for (i = 0; i < gticks; i++)
-					printf("#");
-				printf("\n");
+					pr_verbose(LOG_DEFAULT, "#");
+				pr_verbose(LOG_DEFAULT, "\n");
 			} else {
-				printf("|\n");
+				pr_verbose(LOG_DEFAULT, "|\n");
 			}
 			group_count = 0;
 		}
@@ -269,24 +272,24 @@ static void print_seek_histogram(struct root_stats *stat)
 		if (ticks <= 2)
 			continue;
 
-		printf("\t\t%*Lu - %*Lu: %*Lu ", digits, seek->distance,
+		pr_verbose(LOG_DEFAULT, "\t\t%*llu - %*llu: %*llu ", digits, seek->distance,
 		       digits, seek->distance, digits, seek->count);
 		for (i = 0; i < ticks; i++)
-			printf("#");
-		printf("\n");
+			pr_verbose(LOG_DEFAULT, "#");
+		pr_verbose(LOG_DEFAULT, "\n");
 	}
 	if (group_count) {
 		u64 gticks;
 
 		gticks = group_count / tick_interval;
-		printf("\t\t%*Lu - %*Lu: %*Lu ", digits, group_start,
+		pr_verbose(LOG_DEFAULT, "\t\t%*llu - %*llu: %*llu ", digits, group_start,
 		       digits, group_end, digits, group_count);
 		if (gticks) {
 			for (i = 0; i < gticks; i++)
-				printf("#");
-			printf("\n");
+				pr_verbose(LOG_DEFAULT, "#");
+			pr_verbose(LOG_DEFAULT, "\n");
 		} else {
-			printf("|\n");
+			pr_verbose(LOG_DEFAULT, "|\n");
 		}
 		group_count = 0;
 	}
@@ -312,10 +315,10 @@ static void timeval_subtract(struct timeval *result, struct timeval *x,
 }
 
 static int calc_root_size(struct btrfs_root *tree_root, struct btrfs_key *key,
-			  int find_inline)
+			  int find_inline, unsigned int unit_mode)
 {
 	struct btrfs_root *root;
-	struct btrfs_path path;
+	struct btrfs_path path = { 0 };
 	struct rb_node *n;
 	struct timeval start, end, diff = {0};
 	struct root_stats stat;
@@ -330,7 +333,6 @@ static int calc_root_size(struct btrfs_root *tree_root, struct btrfs_key *key,
 		return 1;
 	}
 
-	btrfs_init_path(&path);
 	memset(&stat, 0, sizeof(stat));
 	level = btrfs_header_level(root->node);
 	stat.lowest_bytenr = btrfs_header_bytenr(root->node);
@@ -363,60 +365,59 @@ out_print:
 		stat.total_clusters = 1;
 	}
 
-	if (no_pretty || size_fail) {
-		printf("\tTotal size: %llu\n", stat.total_bytes);
-		printf("\t\tInline data: %llu\n", stat.total_inline);
-		printf("\tTotal seeks: %llu\n", stat.total_seeks);
-		printf("\t\tForward seeks: %llu\n", stat.forward_seeks);
-		printf("\t\tBackward seeks: %llu\n", stat.backward_seeks);
-		printf("\t\tAvg seek len: %llu\n", stat.total_seeks ?
+	if (unit_mode == UNITS_RAW || size_fail) {
+		pr_verbose(LOG_DEFAULT, "\tTotal size: %llu\n", stat.total_bytes);
+		pr_verbose(LOG_DEFAULT, "\t\tInline data: %llu\n", stat.total_inline);
+		pr_verbose(LOG_DEFAULT, "\tTotal seeks: %llu\n", stat.total_seeks);
+		pr_verbose(LOG_DEFAULT, "\t\tForward seeks: %llu\n", stat.forward_seeks);
+		pr_verbose(LOG_DEFAULT, "\t\tBackward seeks: %llu\n", stat.backward_seeks);
+		pr_verbose(LOG_DEFAULT, "\t\tAvg seek len: %llu\n", stat.total_seeks ?
 			stat.total_seek_len / stat.total_seeks : 0);
 		print_seek_histogram(&stat);
-		printf("\tTotal clusters: %llu\n", stat.total_clusters);
-		printf("\t\tAvg cluster size: %llu\n", stat.total_cluster_size /
+		pr_verbose(LOG_DEFAULT, "\tTotal clusters: %llu\n", stat.total_clusters);
+		pr_verbose(LOG_DEFAULT, "\t\tAvg cluster size: %llu\n", stat.total_cluster_size /
 		       stat.total_clusters);
-		printf("\t\tMin cluster size: %llu\n", stat.min_cluster_size);
-		printf("\t\tMax cluster size: %llu\n", stat.max_cluster_size);
-		printf("\tTotal disk spread: %llu\n", stat.highest_bytenr -
+		pr_verbose(LOG_DEFAULT, "\t\tMin cluster size: %llu\n", stat.min_cluster_size);
+		pr_verbose(LOG_DEFAULT, "\t\tMax cluster size: %llu\n", stat.max_cluster_size);
+		pr_verbose(LOG_DEFAULT, "\tTotal disk spread: %llu\n", stat.highest_bytenr -
 		       stat.lowest_bytenr);
-		printf("\tTotal read time: %d s %d us\n", (int)diff.tv_sec,
+		pr_verbose(LOG_DEFAULT, "\tTotal read time: %d s %d us\n", (int)diff.tv_sec,
 		       (int)diff.tv_usec);
 	} else {
-		printf("\tTotal size: %s\n", pretty_size(stat.total_bytes));
-		printf("\t\tInline data: %s\n", pretty_size(stat.total_inline));
-		printf("\tTotal seeks: %llu\n", stat.total_seeks);
-		printf("\t\tForward seeks: %llu\n", stat.forward_seeks);
-		printf("\t\tBackward seeks: %llu\n", stat.backward_seeks);
-		printf("\t\tAvg seek len: %s\n", stat.total_seeks ?
-			pretty_size(stat.total_seek_len / stat.total_seeks) :
-			pretty_size(0));
+		pr_verbose(LOG_DEFAULT, "\tTotal size: %s\n", pretty_size_mode(stat.total_bytes, unit_mode));
+		pr_verbose(LOG_DEFAULT, "\t\tInline data: %s\n", pretty_size_mode(stat.total_inline, unit_mode));
+		pr_verbose(LOG_DEFAULT, "\tTotal seeks: %llu\n", stat.total_seeks);
+		pr_verbose(LOG_DEFAULT, "\t\tForward seeks: %llu\n", stat.forward_seeks);
+		pr_verbose(LOG_DEFAULT, "\t\tBackward seeks: %llu\n", stat.backward_seeks);
+		pr_verbose(LOG_DEFAULT, "\t\tAvg seek len: %s\n", stat.total_seeks ?
+			pretty_size_mode(stat.total_seek_len / stat.total_seeks, unit_mode) :
+			pretty_size_mode(0, unit_mode));
 		print_seek_histogram(&stat);
-		printf("\tTotal clusters: %llu\n", stat.total_clusters);
-		printf("\t\tAvg cluster size: %s\n",
-				pretty_size((stat.total_cluster_size /
-						stat.total_clusters)));
-		printf("\t\tMin cluster size: %s\n",
-				pretty_size(stat.min_cluster_size));
-		printf("\t\tMax cluster size: %s\n",
-				pretty_size(stat.max_cluster_size));
-		printf("\tTotal disk spread: %s\n",
-				pretty_size(stat.highest_bytenr -
-					stat.lowest_bytenr));
-		printf("\tTotal read time: %d s %d us\n", (int)diff.tv_sec,
+		pr_verbose(LOG_DEFAULT, "\tTotal clusters: %llu\n", stat.total_clusters);
+		pr_verbose(LOG_DEFAULT, "\t\tAvg cluster size: %s\n",
+				pretty_size_mode((stat.total_cluster_size /
+						  stat.total_clusters), unit_mode));
+		pr_verbose(LOG_DEFAULT, "\t\tMin cluster size: %s\n",
+				pretty_size_mode(stat.min_cluster_size, unit_mode));
+		pr_verbose(LOG_DEFAULT, "\t\tMax cluster size: %s\n",
+				pretty_size_mode(stat.max_cluster_size, unit_mode));
+		pr_verbose(LOG_DEFAULT, "\tTotal disk spread: %s\n",
+				pretty_size_mode(stat.highest_bytenr - stat.lowest_bytenr, unit_mode));
+		pr_verbose(LOG_DEFAULT, "\tTotal read time: %d s %d us\n", (int)diff.tv_sec,
 		       (int)diff.tv_usec);
 	}
-	printf("\tLevels: %d\n", level + 1);
-	printf("\tTotal nodes: %llu\n", stat.total_nodes);
+	pr_verbose(LOG_DEFAULT, "\tLevels: %d\n", level + 1);
+	pr_verbose(LOG_DEFAULT, "\tTotal nodes: %llu\n", stat.total_nodes);
 	for (i = 0; i < level + 1; i++) {
-		printf("\t\tOn level %d: %8llu", i, stat.node_counts[i]);
+		pr_verbose(LOG_DEFAULT, "\t\tOn level %d: %8llu", i, stat.node_counts[i]);
 		if (i > 0) {
 			u64 fanout;
 
 			fanout = stat.node_counts[i - 1];
 			fanout /= stat.node_counts[i];
-			printf("  (avg fanout %llu)", fanout);
+			pr_verbose(LOG_DEFAULT, "  (avg fanout %llu)", fanout);
 		}
-		printf("\n");
+		pr_verbose(LOG_DEFAULT, "\n");
 	}
 out:
 	while ((n = rb_first(&stat.seek_root)) != NULL) {
@@ -438,26 +439,39 @@ static const char * const cmd_inspect_tree_stats_usage[] = {
 	"btrfs inspect-internal tree-stats [options] <device>",
 	"Print various stats for trees",
 	"",
-	"-b		raw numbers in bytes",
+	OPTLINE("-b", "raw numbers in bytes"),
+	HELPINFO_UNITS_LONG,
+	OPTLINE("-t <rootid>", "print only tree with the given rootid"),
 	NULL
 };
 
 static int cmd_inspect_tree_stats(const struct cmd_struct *cmd,
 				  int argc, char **argv)
 {
-	struct btrfs_key key;
+	struct btrfs_key key = { .type = BTRFS_ROOT_ITEM_KEY };
 	struct btrfs_root *root;
+	unsigned int unit_mode = UNITS_DEFAULT;
 	int opt;
 	int ret = 0;
+	u64 tree_id = 0;
+
+	unit_mode = get_unit_mode_from_arg(&argc, argv, 0);
 
 	optind = 0;
-	while ((opt = getopt(argc, argv, "vb")) != -1) {
+	while ((opt = getopt(argc, argv, "vbt:")) != -1) {
 		switch (opt) {
 		case 'v':
 			verbose++;
 			break;
 		case 'b':
-			no_pretty = 1;
+			unit_mode = UNITS_RAW;
+			break;
+		case 't':
+			tree_id = arg_strtou64(optarg);
+			if (!tree_id) {
+				error("unrecognized tree id: %s", optarg);
+				exit(1);
+			}
 			break;
 		default:
 			usage_unknown_option(cmd, argv);
@@ -472,8 +486,9 @@ static int cmd_inspect_tree_stats(const struct cmd_struct *cmd,
 		errno = -ret;
 		warning("unable to check mount status of: %m");
 	} else if (ret) {
-		warning("%s already mounted, results may be inaccurate",
-				argv[optind]);
+		warning("%s already mounted, tree-stats accesses the block devices directly, this may\n"
+			"\tresult in inaccurate numbers, various errors or it may crash if the filesystem\n"
+			"\tchanges unexpectedly, restart if needed or remount read-only", argv[optind]);
 	}
 
 	root = open_ctree(argv[optind], 0, 0);
@@ -482,28 +497,36 @@ static int cmd_inspect_tree_stats(const struct cmd_struct *cmd,
 		exit(1);
 	}
 
-	printf("Calculating size of root tree\n");
+	if (tree_id) {
+		pr_verbose(LOG_DEFAULT, "Calculating size of tree (%llu)\n", tree_id);
+		key.objectid = tree_id;
+		key.offset = (u64)-1;
+		ret = calc_root_size(root, &key, 1, unit_mode);
+		goto out;
+	}
+
+	pr_verbose(LOG_DEFAULT, "Calculating size of root tree\n");
 	key.objectid = BTRFS_ROOT_TREE_OBJECTID;
-	ret = calc_root_size(root, &key, 0);
+	ret = calc_root_size(root, &key, 0, unit_mode);
 	if (ret)
 		goto out;
 
-	printf("Calculating size of extent tree\n");
+	pr_verbose(LOG_DEFAULT, "Calculating size of extent tree\n");
 	key.objectid = BTRFS_EXTENT_TREE_OBJECTID;
-	ret = calc_root_size(root, &key, 0);
+	ret = calc_root_size(root, &key, 0, unit_mode);
 	if (ret)
 		goto out;
 
-	printf("Calculating size of csum tree\n");
+	pr_verbose(LOG_DEFAULT, "Calculating size of csum tree\n");
 	key.objectid = BTRFS_CSUM_TREE_OBJECTID;
-	ret = calc_root_size(root, &key, 0);
+	ret = calc_root_size(root, &key, 0, unit_mode);
 	if (ret)
 		goto out;
 
 	key.objectid = BTRFS_FS_TREE_OBJECTID;
 	key.offset = (u64)-1;
-	printf("Calculating size of fs tree\n");
-	ret = calc_root_size(root, &key, 1);
+	pr_verbose(LOG_DEFAULT, "Calculating size of fs tree\n");
+	ret = calc_root_size(root, &key, 1, unit_mode);
 	if (ret)
 		goto out;
 out:

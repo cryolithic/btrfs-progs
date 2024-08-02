@@ -10,17 +10,17 @@
 #
 # Tested for separate data/metadata and mixed
 
-source "$TEST_TOP/common"
-
-# Travis environment is not reliable for this test
-if [ -n "$TRAVIS_BRANCH" ]; then
-	_not_run "test unreliable in Travis, skipped"
-fi
+source "$TEST_TOP/common" || exit
 
 check_prereq mkfs.btrfs
 check_prereq btrfs
 
 setup_root_helper
+setup_loopdevs 4
+prepare_loopdevs
+dev1=${loopdevs[1]}
+TEST_DEV=$dev1
+msg="Multiple block group profiles detected"
 
 test_run_commands() {
 	run_check "$TOP/btrfs" filesystem usage "$TEST_MNT"
@@ -58,18 +58,12 @@ test_run_commands() {
 	fi
 }
 
-setup_loopdevs 4
-prepare_loopdevs
-dev1=${loopdevs[1]}
-TEST_DEV=$dev1
-msg="Multiple block group profiles detected"
-
 # Data and metadata
 run_check $SUDO_HELPER "$TOP/mkfs.btrfs" -f -d single -m single "${loopdevs[@]}"
 run_check_mount_test_dev
 run_check "$TOP/btrfs" filesystem usage "$TEST_MNT"
-for i in `seq 10`; do
-	run_check $SUDO_HELPER dd if=/dev/zero of="$TEST_MNT"/file$i bs=100M count=1 status=none
+for i in $(seq 10); do
+	run_check $SUDO_HELPER dd if=/dev/zero of="$TEST_MNT/file$i" bs=100M count=1 status=none
 done
 # Create filesystem with single and RAID1 profiles
 run_check $SUDO_HELPER "$TOP/btrfs" balance start -dconvert=raid1,limit=1 "$TEST_MNT"
@@ -82,8 +76,8 @@ run_check $SUDO_HELPER "$TOP/mkfs.btrfs" -f --mixed -d single -m single "${loopd
 run_check_mount_test_dev
 run_check "$TOP/btrfs" filesystem usage "$TEST_MNT"
 # Create 1 and a half of 1G chunks
-for i in `seq 14`; do
-	run_check $SUDO_HELPER dd if=/dev/zero of="$TEST_MNT"/file$i bs=100M count=1 status=none
+for i in $(seq 14); do
+	run_check $SUDO_HELPER dd if=/dev/zero of="$TEST_MNT/file$i" bs=100M count=1 status=none
 done
 # Create filesystem with single and RAID1 profiles, the limit=1 trick does not work
 # so use the usage filter to convert about half of the filesystem

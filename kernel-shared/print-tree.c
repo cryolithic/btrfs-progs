@@ -16,21 +16,33 @@
  * Boston, MA 021110-1307, USA.
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <uuid/uuid.h>
-#include <ctype.h>
 #include "kerncompat.h"
-#include "kernel-lib/radix-tree.h"
+#include <stdio.h>
+#include <ctype.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <string.h>
+#include <time.h>
+#include <uuid/uuid.h>
 #include "kernel-shared/ctree.h"
 #include "kernel-shared/disk-io.h"
 #include "kernel-shared/print-tree.h"
-#include "common/utils.h"
+#include "kernel-shared/volumes.h"
+#include "kernel-shared/compression.h"
+#include "kernel-shared/accessors.h"
+#include "kernel-shared/file-item.h"
+#include "kernel-shared/tree-checker.h"
+#include "common/defs.h"
+#include "common/internal.h"
+#include "common/messages.h"
+#include "common/string-utils.h"
+#include "uapi/btrfs.h"
 
 static void print_dir_item_type(struct extent_buffer *eb,
                                 struct btrfs_dir_item *di)
 {
-	u8 type = btrfs_dir_type(eb, di);
+	u8 type = btrfs_dir_ftype(eb, di);
 	static const char* dir_item_str[] = {
 		[BTRFS_FT_REG_FILE]	= "FILE",
 		[BTRFS_FT_DIR] 		= "DIR",
@@ -67,6 +79,11 @@ static void print_dir_item(struct extent_buffer *eb, u32 size,
 		printf("\n");
 		name_len = btrfs_dir_name_len(eb, di);
 		data_len = btrfs_dir_data_len(eb, di);
+		if (data_len + name_len + cur > size) {
+			error("invalid length, cur=%u name_len=%u data_len=%u size=%u",
+			      cur, name_len, data_len, size);
+			break;
+		}
 		len = (name_len <= sizeof(namebuf))? name_len: sizeof(namebuf);
 		printf("\t\ttransid %llu data_len %u name_len %u\n",
 				btrfs_dir_transid(eb, di),
@@ -76,7 +93,9 @@ static void print_dir_item(struct extent_buffer *eb, u32 size,
 		} else {
 			read_extent_buffer(eb, namebuf,
 					(unsigned long)(di + 1), len);
-			printf("\t\tname: %.*s\n", len, namebuf);
+			printf("\t\tname: ");
+			string_print_escape_special_len(namebuf, len);
+			printf("\n");
 		}
 
 		if (data_len) {
@@ -87,7 +106,9 @@ static void print_dir_item(struct extent_buffer *eb, u32 size,
 			} else {
 				read_extent_buffer(eb, namebuf,
 					(unsigned long)(di + 1) + name_len, len);
-				printf("\t\tdata %.*s\n", len, namebuf);
+				printf("\t\tdata ");
+				string_print_escape_special_len(namebuf, len);
+				printf("\n");
 			}
 		}
 		len = sizeof(*di) + name_len + data_len;
@@ -120,7 +141,9 @@ static void print_inode_extref_item(struct extent_buffer *eb, u32 size,
 		} else {
 			read_extent_buffer(eb, namebuf,
 					(unsigned long)extref->name, len);
-			printf("name: %.*s\n", len, namebuf);
+			printf("name: ");
+			string_print_escape_special_len(namebuf, len);
+			printf("\n");
 		}
 
 		len = sizeof(*extref) + name_len;
@@ -150,7 +173,9 @@ static void print_inode_ref_item(struct extent_buffer *eb, u32 size,
 		} else {
 			read_extent_buffer(eb, namebuf,
 					(unsigned long)(ref + 1), len);
-			printf("name: %.*s\n", len, namebuf);
+			printf("name: ");
+			string_print_escape_special_len(namebuf, len);
+			printf("\n");
 		}
 		len = sizeof(*ref) + name_len;
 		ref = (struct btrfs_inode_ref *)((char *)ref + len);
@@ -158,67 +183,71 @@ static void print_inode_ref_item(struct extent_buffer *eb, u32 size,
 	}
 }
 
-/* Caller should ensure sizeof(*ret)>=21 "DATA|METADATA|RAID10" */
+/* The minimal length for the string buffer of block group/chunk flags */
+#define BG_FLAG_STRING_LEN	64
+
 static void bg_flags_to_str(u64 flags, char *ret)
 {
 	int empty = 1;
+	char profile[BG_FLAG_STRING_LEN] = {};
+	const char *name;
 
+	ret[0] = '\0';
 	if (flags & BTRFS_BLOCK_GROUP_DATA) {
 		empty = 0;
-		strcpy(ret, "DATA");
+		strncpy_null(ret, "DATA", BG_FLAG_STRING_LEN);
 	}
 	if (flags & BTRFS_BLOCK_GROUP_METADATA) {
 		if (!empty)
-			strcat(ret, "|");
-		strcat(ret, "METADATA");
+			strncat(ret, "|", BG_FLAG_STRING_LEN);
+		strncat(ret, "METADATA", BG_FLAG_STRING_LEN);
 	}
 	if (flags & BTRFS_BLOCK_GROUP_SYSTEM) {
 		if (!empty)
-			strcat(ret, "|");
-		strcat(ret, "SYSTEM");
+			strncat(ret, "|", BG_FLAG_STRING_LEN);
+		strncat(ret, "SYSTEM", BG_FLAG_STRING_LEN);
 	}
-	switch (flags & BTRFS_BLOCK_GROUP_PROFILE_MASK) {
-	case BTRFS_BLOCK_GROUP_RAID0:
-		strcat(ret, "|RAID0");
-		break;
-	case BTRFS_BLOCK_GROUP_RAID1:
-		strcat(ret, "|RAID1");
-		break;
-	case BTRFS_BLOCK_GROUP_RAID1C3:
-		strcat(ret, "|RAID1C3");
-		break;
-	case BTRFS_BLOCK_GROUP_RAID1C4:
-		strcat(ret, "|RAID1C4");
-		break;
-	case BTRFS_BLOCK_GROUP_DUP:
-		strcat(ret, "|DUP");
-		break;
-	case BTRFS_BLOCK_GROUP_RAID10:
-		strcat(ret, "|RAID10");
-		break;
-	case BTRFS_BLOCK_GROUP_RAID5:
-		strcat(ret, "|RAID5");
-		break;
-	case BTRFS_BLOCK_GROUP_RAID6:
-		strcat(ret, "|RAID6");
-		break;
-	default:
-		break;
+	name = btrfs_bg_type_to_raid_name(flags);
+	if (!name) {
+		snprintf(profile, BG_FLAG_STRING_LEN, "UNKNOWN.0x%llx",
+			 flags & BTRFS_BLOCK_GROUP_PROFILE_MASK);
+	} else {
+		/*
+		 * Special handing for SINGLE profile, we don't output "SINGLE"
+		 * for SINGLE profile, since there is no such bit for it.
+		 * Thus here we only fill @profile if it's not single.
+		 */
+		if (strncmp(name, "SINGLE", strlen("SINGLE")) != 0)
+			strncpy_null(profile, name, BG_FLAG_STRING_LEN);
+	}
+	if (profile[0]) {
+		strncat(ret, "|", BG_FLAG_STRING_LEN);
+		strncat(ret, profile, BG_FLAG_STRING_LEN);
 	}
 }
 
-/* Caller should ensure sizeof(*ret)>= 26 "OFF|SCANNING|INCONSISTENT" */
+/*
+ * Caller should ensure sizeof(*ret) >= 64
+ * "OFF|SCANNING|INCONSISTENT|UNKNOWN(0xffffffffffffffff)"
+ */
 static void qgroup_flags_to_str(u64 flags, char *ret)
 {
+	ret[0] = 0;
+
 	if (flags & BTRFS_QGROUP_STATUS_FLAG_ON)
 		strcpy(ret, "ON");
 	else
 		strcpy(ret, "OFF");
 
+	if (flags & BTRFS_QGROUP_STATUS_FLAG_SIMPLE_MODE)
+		strcat(ret, "|SIMPLE_MODE");
 	if (flags & BTRFS_QGROUP_STATUS_FLAG_RESCAN)
 		strcat(ret, "|SCANNING");
 	if (flags & BTRFS_QGROUP_STATUS_FLAG_INCONSISTENT)
 		strcat(ret, "|INCONSISTENT");
+	if (flags & ~BTRFS_QGROUP_STATUS_FLAGS_MASK)
+		sprintf(ret + strlen(ret), "|UNKNOWN(0x%llx)",
+			flags & ~BTRFS_QGROUP_STATUS_FLAGS_MASK);
 }
 
 void print_chunk_item(struct extent_buffer *eb, struct btrfs_chunk *chunk)
@@ -226,7 +255,7 @@ void print_chunk_item(struct extent_buffer *eb, struct btrfs_chunk *chunk)
 	u16 num_stripes = btrfs_chunk_num_stripes(eb, chunk);
 	int i;
 	u32 chunk_item_size;
-	char chunk_flags_str[32] = {0};
+	char chunk_flags_str[BG_FLAG_STRING_LEN] = {};
 
 	/* The chunk must contain at least one stripe */
 	if (num_stripes < 1) {
@@ -296,7 +325,7 @@ static void print_dev_item(struct extent_buffer *eb,
 			   (unsigned long)btrfs_device_fsid(dev_item),
 			   BTRFS_UUID_SIZE);
 	uuid_unparse(fsid, fsid_str);
-	printf("\t\tdevid %llu total_bytes %llu bytes_used %Lu\n"
+	printf("\t\tdevid %llu total_bytes %llu bytes_used %llu\n"
 	       "\t\tio_align %u io_width %u sector_size %u type %llu\n"
 	       "\t\tgeneration %llu start_offset %llu dev_group %u\n"
 	       "\t\tseek_speed %hhu bandwidth %hhu\n"
@@ -369,7 +398,6 @@ static const char* file_extent_type_to_str(u8 type)
 }
 
 static void print_file_extent_item(struct extent_buffer *eb,
-				   struct btrfs_item *item,
 				   int slot,
 				   struct btrfs_file_extent_item *fi)
 {
@@ -385,7 +413,7 @@ static void print_file_extent_item(struct extent_buffer *eb,
 
 	if (extent_type == BTRFS_FILE_EXTENT_INLINE) {
 		printf("\t\tinline extent data size %u ram_bytes %llu compression %hhu (%s)\n",
-				btrfs_file_extent_inline_item_len(eb, item),
+				btrfs_file_extent_inline_item_len(eb, slot),
 				btrfs_file_extent_ram_bytes(eb, fi),
 				btrfs_file_extent_compression(eb, fi),
 				compress_str);
@@ -417,6 +445,7 @@ static void extent_flags_to_str(u64 flags, char *ret)
 {
 	int empty = 1;
 
+	ret[0] = 0;
 	if (flags & BTRFS_EXTENT_FLAG_DATA) {
 		empty = 0;
 		strcpy(ret, "DATA");
@@ -444,7 +473,7 @@ void print_extent_item(struct extent_buffer *eb, int slot, int metadata)
 	unsigned long end;
 	unsigned long ptr;
 	int type;
-	u32 item_size = btrfs_item_size_nr(eb, slot);
+	u32 item_size = btrfs_item_size(eb, slot);
 	u64 flags;
 	u64 offset;
 	char flags_str[32] = {0};
@@ -482,34 +511,43 @@ void print_extent_item(struct extent_buffer *eb, int slot, int metadata)
 	ptr = (unsigned long)iref;
 	end = (unsigned long)ei + item_size;
 	while (ptr < end) {
+		u64 seq;
+
 		iref = (struct btrfs_extent_inline_ref *)ptr;
 		type = btrfs_extent_inline_ref_type(eb, iref);
 		offset = btrfs_extent_inline_ref_offset(eb, iref);
+		seq = offset;
 		switch (type) {
 		case BTRFS_TREE_BLOCK_REF_KEY:
-			printf("\t\ttree block backref root ");
+			printf("\t\t(%u 0x%llx) tree block backref root ", type, seq);
 			print_objectid(stdout, offset, 0);
 			printf("\n");
 			break;
 		case BTRFS_SHARED_BLOCK_REF_KEY:
-			printf("\t\tshared block backref parent %llu\n",
-			       (unsigned long long)offset);
+			printf("\t\t(%u 0x%llx) shared block backref parent %llu\n",
+			       type, seq, offset);
 			break;
 		case BTRFS_EXTENT_DATA_REF_KEY:
 			dref = (struct btrfs_extent_data_ref *)(&iref->offset);
-			printf("\t\textent data backref root ");
-			print_objectid(stdout,
-		(unsigned long long)btrfs_extent_data_ref_root(eb, dref), 0);
+			seq = hash_extent_data_ref(
+					btrfs_extent_data_ref_root(eb, dref),
+					btrfs_extent_data_ref_objectid(eb, dref),
+					btrfs_extent_data_ref_offset(eb, dref));
+			printf("\t\t(%u 0x%llx) extent data backref root ", type, seq);
+			print_objectid(stdout, btrfs_extent_data_ref_root(eb, dref), 0);
 			printf(" objectid %llu offset %llu count %u\n",
-			       (unsigned long long)btrfs_extent_data_ref_objectid(eb, dref),
+			       btrfs_extent_data_ref_objectid(eb, dref),
 			       btrfs_extent_data_ref_offset(eb, dref),
 			       btrfs_extent_data_ref_count(eb, dref));
 			break;
 		case BTRFS_SHARED_DATA_REF_KEY:
 			sref = (struct btrfs_shared_data_ref *)(iref + 1);
-			printf("\t\tshared data backref parent %llu count %u\n",
-			       (unsigned long long)offset,
-			       btrfs_shared_data_ref_count(eb, sref));
+			printf("\t\t(%u 0x%llx) shared data backref parent %llu count %u\n",
+			       type, seq, offset, btrfs_shared_data_ref_count(eb, sref));
+			break;
+		case BTRFS_EXTENT_OWNER_REF_KEY:
+			printf("\t\(%u 0x%llx) textent owner root %llu\n",
+			       type, seq, offset);
 			break;
 		default:
 			return;
@@ -532,16 +570,6 @@ static void print_root_ref(struct extent_buffer *leaf, int slot, const char *tag
 	       (unsigned long long)btrfs_root_ref_dirid(leaf, ref),
 	       (unsigned long long)btrfs_root_ref_sequence(leaf, ref),
 	       namelen, namebuf);
-}
-
-static int empty_uuid(const u8 *uuid)
-{
-	int i;
-
-	for (i = 0; i < BTRFS_UUID_SIZE; i++)
-		if (uuid[i])
-			return 0;
-	return 1;
 }
 
 /*
@@ -585,61 +613,52 @@ static void print_root_item(struct extent_buffer *leaf, int slot)
 	struct btrfs_key drop_key;
 
 	ri = btrfs_item_ptr(leaf, slot, struct btrfs_root_item);
-	len = btrfs_item_size_nr(leaf, slot);
+	len = btrfs_item_size(leaf, slot);
 
 	memset(&root_item, 0, sizeof(root_item));
 	read_extent_buffer(leaf, &root_item, (unsigned long)ri, len);
 	root_flags_to_str(btrfs_root_flags(&root_item), flags_str);
 
-	printf("\t\tgeneration %llu root_dirid %llu bytenr %llu level %hhu refs %u\n",
+	printf("\t\tgeneration %llu root_dirid %llu bytenr %llu byte_limit %llu bytes_used %llu\n",
 		(unsigned long long)btrfs_root_generation(&root_item),
 		(unsigned long long)btrfs_root_dirid(&root_item),
 		(unsigned long long)btrfs_root_bytenr(&root_item),
-		btrfs_root_level(&root_item),
-		btrfs_root_refs(&root_item));
-	printf("\t\tlastsnap %llu byte_limit %llu bytes_used %llu flags 0x%llx(%s)\n",
-		(unsigned long long)btrfs_root_last_snapshot(&root_item),
 		(unsigned long long)btrfs_root_limit(&root_item),
-		(unsigned long long)btrfs_root_used(&root_item),
+		(unsigned long long)btrfs_root_used(&root_item));
+	printf("\t\tlast_snapshot %llu flags 0x%llx(%s) refs %u\n",
+		(unsigned long long)btrfs_root_last_snapshot(&root_item),
 		(unsigned long long)btrfs_root_flags(&root_item),
-		flags_str);
+		flags_str,
+		btrfs_root_refs(&root_item));
+	btrfs_disk_key_to_cpu(&drop_key, &root_item.drop_progress);
+	printf("\t\tdrop_progress ");
+	btrfs_print_key(&root_item.drop_progress);
+	printf(" drop_level %hhu\n", root_item.drop_level);
+
+	printf("\t\tlevel %hhu generation_v2 %llu\n",
+		btrfs_root_level(&root_item), root_item.generation_v2);
 
 	if (root_item.generation == root_item.generation_v2) {
 		uuid_unparse(root_item.uuid, uuid_str);
 		printf("\t\tuuid %s\n", uuid_str);
-		if (!empty_uuid(root_item.parent_uuid)) {
-			uuid_unparse(root_item.parent_uuid, uuid_str);
-			printf("\t\tparent_uuid %s\n", uuid_str);
-		}
-		if (!empty_uuid(root_item.received_uuid)) {
-			uuid_unparse(root_item.received_uuid, uuid_str);
-			printf("\t\treceived_uuid %s\n", uuid_str);
-		}
-		if (root_item.ctransid) {
-			printf("\t\tctransid %llu otransid %llu stransid %llu rtransid %llu\n",
+		uuid_unparse(root_item.parent_uuid, uuid_str);
+		printf("\t\tparent_uuid %s\n", uuid_str);
+		uuid_unparse(root_item.received_uuid, uuid_str);
+		printf("\t\treceived_uuid %s\n", uuid_str);
+		printf("\t\tctransid %llu otransid %llu stransid %llu rtransid %llu\n",
 				btrfs_root_ctransid(&root_item),
 				btrfs_root_otransid(&root_item),
 				btrfs_root_stransid(&root_item),
 				btrfs_root_rtransid(&root_item));
-		}
-		if (btrfs_timespec_sec(leaf, btrfs_root_ctime(ri)))
-			print_timespec(leaf, btrfs_root_ctime(ri),
+		print_timespec(leaf, btrfs_root_ctime(ri),
 					"\t\tctime ", "\n");
-		if (btrfs_timespec_sec(leaf, btrfs_root_otime(ri)))
-			print_timespec(leaf, btrfs_root_otime(ri),
+		print_timespec(leaf, btrfs_root_otime(ri),
 					"\t\totime ", "\n");
-		if (btrfs_timespec_sec(leaf, btrfs_root_stime(ri)))
-			print_timespec(leaf, btrfs_root_stime(ri),
+		print_timespec(leaf, btrfs_root_stime(ri),
 					"\t\tstime ", "\n");
-		if (btrfs_timespec_sec(leaf, btrfs_root_rtime(ri)))
-			print_timespec(leaf, btrfs_root_rtime(ri),
+		print_timespec(leaf, btrfs_root_rtime(ri),
 					"\t\trtime ", "\n");
 	}
-
-	btrfs_disk_key_to_cpu(&drop_key, &root_item.drop_progress);
-	printf("\t\tdrop ");
-	btrfs_print_key(&root_item.drop_progress);
-	printf(" level %hhu\n", root_item.drop_level);
 }
 
 static void print_free_space_header(struct extent_buffer *leaf, int slot)
@@ -658,6 +677,17 @@ static void print_free_space_header(struct extent_buffer *leaf, int slot)
 	       (unsigned long long)btrfs_free_space_bitmaps(leaf, header));
 }
 
+static void print_raid_stripe_key(struct extent_buffer *eb,
+				  u32 item_size, struct btrfs_stripe_extent *stripe)
+{
+	int num_stripes = item_size / sizeof(struct btrfs_raid_stride);
+
+	for (int i = 0; i < num_stripes; i++)
+		printf("\t\t\tstripe %d devid %llu physical %llu\n", i,
+		       (unsigned long long)btrfs_raid_stride_devid_nr(eb, stripe, i),
+		       (unsigned long long)btrfs_raid_stride_offset_nr(eb, stripe, i));
+}
+
 void print_key_type(FILE *stream, u64 objectid, u8 type)
 {
 	static const char* key_to_str[256] = {
@@ -669,6 +699,8 @@ void print_key_type(FILE *stream, u64 objectid, u8 type)
 		[BTRFS_DIR_LOG_ITEM_KEY]	= "DIR_LOG_ITEM",
 		[BTRFS_DIR_LOG_INDEX_KEY]	= "DIR_LOG_INDEX",
 		[BTRFS_XATTR_ITEM_KEY]		= "XATTR_ITEM",
+		[BTRFS_VERITY_DESC_ITEM_KEY]	= "VERITY_DESC_ITEM",
+		[BTRFS_VERITY_MERKLE_ITEM_KEY]	= "VERITY_MERKLE_ITEM",
 		[BTRFS_ORPHAN_ITEM_KEY]		= "ORPHAN_ITEM",
 		[BTRFS_ROOT_ITEM_KEY]		= "ROOT_ITEM",
 		[BTRFS_ROOT_REF_KEY]		= "ROOT_REF",
@@ -680,6 +712,7 @@ void print_key_type(FILE *stream, u64 objectid, u8 type)
 		[BTRFS_EXTENT_DATA_REF_KEY]	= "EXTENT_DATA_REF",
 		[BTRFS_SHARED_DATA_REF_KEY]	= "SHARED_DATA_REF",
 		[BTRFS_EXTENT_REF_V0_KEY]	= "EXTENT_REF_V0",
+		[BTRFS_EXTENT_OWNER_REF_KEY]	= "EXTENT_OWNER_REF",
 		[BTRFS_CSUM_ITEM_KEY]		= "CSUM_ITEM",
 		[BTRFS_EXTENT_CSUM_KEY]		= "EXTENT_CSUM",
 		[BTRFS_EXTENT_DATA_KEY]		= "EXTENT_DATA",
@@ -700,6 +733,7 @@ void print_key_type(FILE *stream, u64 objectid, u8 type)
 		[BTRFS_PERSISTENT_ITEM_KEY]	= "PERSISTENT_ITEM",
 		[BTRFS_UUID_KEY_SUBVOL]		= "UUID_KEY_SUBVOL",
 		[BTRFS_UUID_KEY_RECEIVED_SUBVOL] = "UUID_KEY_RECEIVED_SUBVOL",
+		[BTRFS_RAID_STRIPE_KEY]		= "RAID_STRIPE",
 	};
 
 	if (type == 0 && objectid == BTRFS_FREE_SPACE_OBJECTID) {
@@ -728,8 +762,8 @@ void print_objectid(FILE *stream, u64 objectid, u8 type)
 		fprintf(stream, "%llu", (unsigned long long)objectid);
 		return;
 	case BTRFS_QGROUP_RELATION_KEY:
-		fprintf(stream, "%llu/%llu", btrfs_qgroup_level(objectid),
-		       btrfs_qgroup_subvid(objectid));
+		fprintf(stream, "%u/%llu", btrfs_qgroup_level(objectid),
+		       btrfs_qgroup_subvolid(objectid));
 		return;
 	case BTRFS_UUID_KEY_SUBVOL:
 	case BTRFS_UUID_KEY_RECEIVED_SUBVOL:
@@ -806,6 +840,15 @@ void print_objectid(FILE *stream, u64 objectid, u8 type)
 	case BTRFS_MULTIPLE_OBJECTIDS:
 		fprintf(stream, "MULTIPLE");
 		break;
+	case BTRFS_BLOCK_GROUP_TREE_OBJECTID:
+		fprintf(stream, "BLOCK_GROUP_TREE");
+		break;
+	case BTRFS_CSUM_CHANGE_OBJECTID:
+		fprintf(stream, "CSUM_CHANGE");
+		break;
+	case  BTRFS_RAID_STRIPE_TREE_OBJECTID:
+		fprintf(stream, "RAID_STRIPE_TREE");
+		break;
 	case (u64)-1:
 		fprintf(stream, "-1");
 		break;
@@ -814,7 +857,7 @@ void print_objectid(FILE *stream, u64 objectid, u8 type)
 			fprintf(stream, "FIRST_CHUNK_TREE");
 			break;
 		}
-		/* fall-thru */
+		fallthrough;
 	default:
 		fprintf(stream, "%llu", (unsigned long long)objectid);
 	}
@@ -834,8 +877,8 @@ void btrfs_print_key(struct btrfs_disk_key *disk_key)
 	case BTRFS_QGROUP_RELATION_KEY:
 	case BTRFS_QGROUP_INFO_KEY:
 	case BTRFS_QGROUP_LIMIT_KEY:
-		printf(" %llu/%llu)", btrfs_qgroup_level(offset),
-		       btrfs_qgroup_subvid(offset));
+		printf(" %u/%llu)", btrfs_qgroup_level(offset),
+		       btrfs_qgroup_subvolid(offset));
 		break;
 	case BTRFS_UUID_KEY_SUBVOL:
 	case BTRFS_UUID_KEY_RECEIVED_SUBVOL:
@@ -977,15 +1020,20 @@ static void print_disk_balance_args(struct btrfs_disk_balance_args *ba)
 static void print_balance_item(struct extent_buffer *eb,
 		struct btrfs_balance_item *bi)
 {
+	struct btrfs_disk_balance_args ba;
+
 	printf("\t\tbalance status flags %llu\n",
-			btrfs_balance_item_flags(eb, bi));
+			btrfs_balance_flags(eb, bi));
 
 	printf("\t\tDATA\n");
-	print_disk_balance_args(btrfs_balance_item_data(eb, bi));
+	btrfs_balance_data(eb, bi, &ba);
+	print_disk_balance_args(&ba);
 	printf("\t\tMETADATA\n");
-	print_disk_balance_args(btrfs_balance_item_meta(eb, bi));
+	btrfs_balance_meta(eb, bi, &ba);
+	print_disk_balance_args(&ba);
 	printf("\t\tSYSTEM\n");
-	print_disk_balance_args(btrfs_balance_item_sys(eb, bi));
+	btrfs_balance_sys(eb, bi, &ba);
+	print_disk_balance_args(&ba);
 }
 
 static void print_dev_stats(struct extent_buffer *eb,
@@ -1016,7 +1064,7 @@ static void print_block_group_item(struct extent_buffer *eb,
 		struct btrfs_block_group_item *bgi)
 {
 	struct btrfs_block_group_item bg_item;
-	char flags_str[256];
+	char flags_str[BG_FLAG_STRING_LEN] = {};
 
 	read_extent_buffer(eb, &bg_item, (unsigned long)bgi, sizeof(bg_item));
 	memset(flags_str, 0, sizeof(flags_str));
@@ -1048,6 +1096,17 @@ static void print_shared_data_ref(struct extent_buffer *eb, int slot)
 	sref = btrfs_item_ptr(eb, slot, struct btrfs_shared_data_ref);
 	printf("\t\tshared data backref count %u\n",
 		btrfs_shared_data_ref_count(eb, sref));
+}
+
+static void print_extent_owner_ref(struct extent_buffer *eb, int slot)
+{
+	struct btrfs_extent_owner_ref *oref;
+	u64 root_id;
+
+	oref = btrfs_item_ptr(eb, slot, struct btrfs_extent_owner_ref);
+	root_id = btrfs_extent_owner_ref_root_id(eb, oref);
+
+	printf("\t\textent owner root %llu\n", root_id);
 }
 
 static void print_free_space_info(struct extent_buffer *eb, int slot)
@@ -1091,11 +1150,16 @@ static void print_qgroup_status(struct extent_buffer *eb, int slot)
 	memset(flags_str, 0, sizeof(flags_str));
 	qgroup_flags_to_str(btrfs_qgroup_status_flags(eb, qg_status),
 					flags_str);
-	printf("\t\tversion %llu generation %llu flags %s scan %llu\n",
+	printf("\t\tversion %llu generation %llu flags %s scan %llu",
 		(unsigned long long)btrfs_qgroup_status_version(eb, qg_status),
 		(unsigned long long)btrfs_qgroup_status_generation(eb, qg_status),
 		flags_str,
 		(unsigned long long)btrfs_qgroup_status_rescan(eb, qg_status));
+	if (btrfs_fs_incompat(eb->fs_info, SIMPLE_QUOTA))
+		printf(" enable_gen %llu\n",
+			   (unsigned long long)btrfs_qgroup_status_enable_gen(eb, qg_status));
+	else
+		printf("\n");
 }
 
 static void print_qgroup_info(struct extent_buffer *eb, int slot)
@@ -1107,12 +1171,10 @@ static void print_qgroup_info(struct extent_buffer *eb, int slot)
 		"\t\treferenced %llu referenced_compressed %llu\n"
 		"\t\texclusive %llu exclusive_compressed %llu\n",
 		(unsigned long long)btrfs_qgroup_info_generation(eb, qg_info),
-		(unsigned long long)btrfs_qgroup_info_referenced(eb, qg_info),
-		(unsigned long long)btrfs_qgroup_info_referenced_compressed(eb,
-								       qg_info),
-		(unsigned long long)btrfs_qgroup_info_exclusive(eb, qg_info),
-		(unsigned long long)btrfs_qgroup_info_exclusive_compressed(eb,
-								      qg_info));
+		(unsigned long long)btrfs_qgroup_info_rfer(eb, qg_info),
+		(unsigned long long)btrfs_qgroup_info_rfer_cmpr(eb, qg_info),
+		(unsigned long long)btrfs_qgroup_info_excl(eb, qg_info),
+		(unsigned long long)btrfs_qgroup_info_excl_cmpr(eb, qg_info));
 }
 
 static void print_qgroup_limit(struct extent_buffer *eb, int slot)
@@ -1124,10 +1186,10 @@ static void print_qgroup_limit(struct extent_buffer *eb, int slot)
 		"\t\tmax_referenced %lld max_exclusive %lld\n"
 		"\t\trsv_referenced %lld rsv_exclusive %lld\n",
 		(unsigned long long)btrfs_qgroup_limit_flags(eb, qg_limit),
-		(long long)btrfs_qgroup_limit_max_referenced(eb, qg_limit),
-		(long long)btrfs_qgroup_limit_max_exclusive(eb, qg_limit),
-		(long long)btrfs_qgroup_limit_rsv_referenced(eb, qg_limit),
-		(long long)btrfs_qgroup_limit_rsv_exclusive(eb, qg_limit));
+		(long long)btrfs_qgroup_limit_max_rfer(eb, qg_limit),
+		(long long)btrfs_qgroup_limit_max_excl(eb, qg_limit),
+		(long long)btrfs_qgroup_limit_rsv_rfer(eb, qg_limit),
+		(long long)btrfs_qgroup_limit_rsv_excl(eb, qg_limit));
 }
 
 static void print_persistent_item(struct extent_buffer *eb, void *ptr,
@@ -1155,29 +1217,71 @@ static void print_temporary_item(struct extent_buffer *eb, void *ptr,
 	case BTRFS_BALANCE_OBJECTID:
 		print_balance_item(eb, ptr);
 		break;
+	case BTRFS_CSUM_CHANGE_OBJECTID:
+		if (offset < btrfs_get_num_csums())
+			printf("\t\ttarget csum type %s (%llu)\n",
+			       btrfs_super_csum_name(offset) ,offset);
+		else
+			printf("\t\tunknown csum type %llu\n", offset);
+		break;
 	default:
 		printf("\t\tunknown temporary item objectid %llu\n", objectid);
 	}
 }
 
 static void print_extent_csum(struct extent_buffer *eb,
-		struct btrfs_fs_info *fs_info, u32 item_size, u64 start)
+		int item_size, u64 offset, void *ptr, bool print_csum_items)
 {
+	struct btrfs_fs_info *fs_info = eb->fs_info;
 	u32 size;
+	int csum_size;
 
 	/*
 	 * If we don't have fs_info, only output its start position as we
 	 * don't have sectorsize for the calculation
 	 */
 	if (!fs_info) {
-		printf("\t\trange start %llu\n", (unsigned long long)start);
+		printf("\t\trange start %llu\n", (unsigned long long)offset);
 		return;
 	}
-	size = (item_size / btrfs_super_csum_size(fs_info->super_copy)) *
-			fs_info->sectorsize;
+	csum_size = fs_info->csum_size;
+	size = (item_size / csum_size) * fs_info->sectorsize;
 	printf("\t\trange start %llu end %llu length %u\n",
-			(unsigned long long)start,
-			(unsigned long long)start + size, size);
+			(unsigned long long)offset,
+			(unsigned long long)offset + size, size);
+
+
+	/*
+	 * Fill one long line, which is 1 item of sha256/blake2,
+	 * 2x xxhash, 4x crc32c with format:
+	 * [offset] 0xCHECKSUM [offset] 0xCHECKSUM
+	 */
+	if (print_csum_items) {
+		const int one_line = max(1, BTRFS_CSUM_SIZE / csum_size / 2);
+		int curline;
+		const u8 *csum = (const u8 *)(eb->data + (unsigned long)ptr);
+
+		curline = one_line;
+		while (size > 0) {
+			int i;
+
+			if (curline == one_line) {
+				printf("\t\t");
+			} else if (curline == 0) {
+				curline = one_line;
+				printf("\n\t\t");
+			} else {
+				putchar(' ');
+			}
+			printf("[%llu] 0x", offset);
+			for (i = 0; i < csum_size; i++)
+				printf("%02x", *csum++);
+			offset += fs_info->sectorsize;
+			size -= fs_info->sectorsize;
+			curline--;
+		}
+		putchar('\n');
+	}
 }
 
 /* Caller must ensure sizeof(*ret) >= 14 "WRITTEN|RELOC" */
@@ -1185,6 +1289,7 @@ static void header_flags_to_str(u64 flags, char *ret)
 {
 	int empty = 1;
 
+	ret[0] = 0;
 	if (flags & BTRFS_HEADER_FLAG_WRITTEN) {
 		empty = 0;
 		strcpy(ret, "WRITTEN");
@@ -1196,12 +1301,19 @@ static void header_flags_to_str(u64 flags, char *ret)
 	}
 }
 
-static void print_header_info(struct extent_buffer *eb)
+static void print_header_info(struct extent_buffer *eb, unsigned int mode)
 {
+	struct btrfs_fs_info *fs_info = eb->fs_info;
 	char flags_str[128];
+#if EXPERIMENTAL
+	u8 csum[BTRFS_CSUM_SIZE];
+#endif
 	u64 flags;
 	u32 nr;
 	u8 backref_rev;
+	char csum_str[2 * BTRFS_CSUM_SIZE + strlen(" csum 0x") + 1];
+	int i;
+	int csum_size = fs_info->csum_size;
 
 	flags = btrfs_header_flags(eb) & ~BTRFS_BACKREF_REV_MASK;
 	backref_rev = btrfs_header_flags(eb) >> BTRFS_BACKREF_REV_SHIFT;
@@ -1222,23 +1334,124 @@ static void print_header_info(struct extent_buffer *eb)
 		       (unsigned long long)btrfs_header_generation(eb));
 	print_objectid(stdout, btrfs_header_owner(eb), 0);
 	printf("\n");
-	printf("%s %llu flags 0x%llx(%s) backref revision %d\n",
+	if (fs_info && (mode & BTRFS_PRINT_TREE_CSUM_HEADERS)) {
+		char *tmp = csum_str;
+		u8 *tree_csum = (u8 *)(eb->data + offsetof(struct btrfs_header, csum));
+
+		strcpy(csum_str, " csum 0x");
+		tmp = csum_str + strlen(csum_str);
+		for (i = 0; i < csum_size; i++) {
+			sprintf(tmp, "%02x", tree_csum[i]);
+			tmp++;
+			tmp++;
+		}
+	} else {
+		/* We don't have fs_info, can't print the csum */
+		csum_str[0] = 0;
+	}
+	printf("%s %llu flags 0x%llx(%s) backref revision %d%s\n",
 	       btrfs_header_level(eb) ? "node" : "leaf",
-	       btrfs_header_bytenr(eb), flags, flags_str, backref_rev);
+	       btrfs_header_bytenr(eb), flags, flags_str, backref_rev,
+	       csum_str);
+
+#if EXPERIMENTAL
+	printf("checksum stored ");
+	for (i = 0; i < csum_size; i++)
+		printf("%02hhx", (int)(eb->data[i]));
+	printf("\n");
+	memset(csum, 0, sizeof(csum));
+	btrfs_csum_data(fs_info, btrfs_super_csum_type(fs_info->super_copy),
+			(u8 *)eb->data + BTRFS_CSUM_SIZE,
+			csum, fs_info->nodesize - BTRFS_CSUM_SIZE);
+	printf("checksum calced ");
+	for (i = 0; i < csum_size; i++)
+		printf("%02hhx", (int)(csum[i]));
+	printf("\n");
+#endif
+
 	print_uuids(eb);
 	fflush(stdout);
 }
 
-void btrfs_print_leaf(struct extent_buffer *eb)
+#define DEV_REPLACE_STRING_LEN				64
+#define CASE_DEV_REPLACE_MODE_ENTRY(dest, name)				\
+	case BTRFS_DEV_REPLACE_ITEM_CONT_READING_FROM_SRCDEV_MODE_##name: \
+		strncpy_null((dest), #name, DEV_REPLACE_STRING_LEN);	\
+		break;
+
+static void replace_mode_to_str(u64 flags, char *ret)
 {
-	struct btrfs_fs_info *fs_info = eb->fs_info;
-	struct btrfs_item *item;
+	ret[0] = 0;
+	switch(flags) {
+	CASE_DEV_REPLACE_MODE_ENTRY(ret, ALWAYS);
+	CASE_DEV_REPLACE_MODE_ENTRY(ret, AVOID);
+	default:
+		snprintf(ret, DEV_REPLACE_STRING_LEN, "unknown(%llu)", flags);
+	}
+}
+#undef DEV_REPLACE_MODE_ENTRY
+
+#define CASE_DEV_REPLACE_STATE_ENTRY(dest, name)			\
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_##name:			\
+		strncpy_null((dest), #name, DEV_REPLACE_STRING_LEN);	\
+		break;
+
+static void replace_state_to_str(u64 flags, char *ret)
+{
+	ret[0] = '\0';
+	switch(flags) {
+	CASE_DEV_REPLACE_STATE_ENTRY(ret, NEVER_STARTED);
+	CASE_DEV_REPLACE_STATE_ENTRY(ret, FINISHED);
+	CASE_DEV_REPLACE_STATE_ENTRY(ret, CANCELED);
+	CASE_DEV_REPLACE_STATE_ENTRY(ret, STARTED);
+	CASE_DEV_REPLACE_STATE_ENTRY(ret, SUSPENDED);
+	default:
+		snprintf(ret, DEV_REPLACE_STRING_LEN, "unknown(%llu)", flags);
+	}
+}
+#undef DEV_REPLACE_STATE_ENTRY
+
+static void print_u64_timespec(u64 timespec, const char *prefix)
+{
+	char time_str[256];
+	struct tm tm;
+	time_t time = timespec;
+
+	localtime_r(&time, &tm);
+	strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm);
+	printf("%s%llu (%s)\n", prefix, timespec, time_str);
+}
+
+static void print_dev_replace_item(struct extent_buffer *eb, struct btrfs_dev_replace_item *ptr)
+{
+	char mode_str[DEV_REPLACE_STRING_LEN] = { 0 };
+	char state_str[DEV_REPLACE_STRING_LEN] = { 0 };
+
+	replace_mode_to_str(btrfs_dev_replace_cont_reading_from_srcdev_mode(eb, ptr),
+			mode_str);
+	replace_state_to_str(btrfs_dev_replace_replace_state(eb, ptr),
+			     state_str);
+	printf("\t\tsrc devid %lld cursor left %llu cursor right %llu mode %s\n",
+		btrfs_dev_replace_src_devid(eb, ptr),
+		btrfs_dev_replace_cursor_left(eb, ptr),
+		btrfs_dev_replace_cursor_right(eb, ptr),
+		mode_str);
+	printf("\t\tstate %s write errors %llu uncorrectable read errors %llu\n",
+		state_str, btrfs_dev_replace_num_write_errors(eb, ptr),
+		btrfs_dev_replace_num_uncorrectable_read_errors(eb, ptr));
+	print_u64_timespec(btrfs_dev_replace_time_started(eb, ptr), "\t\tstart time ");
+	print_u64_timespec(btrfs_dev_replace_time_started(eb, ptr), "\t\tstop time ");
+}
+
+void __btrfs_print_leaf(struct extent_buffer *eb, unsigned int mode)
+{
 	struct btrfs_disk_key disk_key;
-	u32 leaf_data_size = __BTRFS_LEAF_DATA_SIZE(eb->len);
+	u32 leaf_data_size = BTRFS_LEAF_DATA_SIZE(eb->fs_info);
 	u32 i;
 	u32 nr;
+	const bool print_csum_items = (mode & BTRFS_PRINT_TREE_CSUM_ITEMS);
 
-	print_header_info(eb);
+	print_header_info(eb, mode);
 	nr = btrfs_header_nritems(eb);
 	for (i = 0; i < nr; i++) {
 		u32 item_size;
@@ -1253,19 +1466,18 @@ void btrfs_print_leaf(struct extent_buffer *eb)
 		 * Only need to ensure all pointers are pointing range inside
 		 * the leaf, thus no segfault.
 		 */
-		if (btrfs_item_offset_nr(eb, i) > leaf_data_size ||
-		    btrfs_item_size_nr(eb, i) + btrfs_item_offset_nr(eb, i) >
+		if (btrfs_item_offset(eb, i) > leaf_data_size ||
+		    btrfs_item_size(eb, i) + btrfs_item_offset(eb, i) >
 		    leaf_data_size) {
 			error(
 "leaf %llu slot %u pointer invalid, offset %u size %u leaf data limit %u",
 			      btrfs_header_bytenr(eb), i,
-			      btrfs_item_offset_nr(eb, i),
-			      btrfs_item_size_nr(eb, i), leaf_data_size);
+			      btrfs_item_offset(eb, i),
+			      btrfs_item_size(eb, i), leaf_data_size);
 			error("skip remaining slots");
 			break;
 		}
-		item = btrfs_item_nr(i);
-		item_size = btrfs_item_size(eb, item);
+		item_size = btrfs_item_size(eb, i);
 		/* Untyped extraction of slot from btrfs_item_ptr */
 		ptr = btrfs_item_ptr(eb, i, void*);
 
@@ -1277,8 +1489,8 @@ void btrfs_print_leaf(struct extent_buffer *eb)
 		printf("\titem %u ", i);
 		btrfs_print_key(&disk_key);
 		printf(" itemoff %u itemsize %u\n",
-			btrfs_item_offset(eb, item),
-			btrfs_item_size(eb, item));
+			btrfs_item_offset(eb, i),
+			btrfs_item_size(eb, i));
 
 		if (type == 0 && objectid == BTRFS_FREE_SPACE_OBJECTID)
 			print_free_space_header(eb, i);
@@ -1303,7 +1515,7 @@ void btrfs_print_leaf(struct extent_buffer *eb)
 			struct btrfs_dir_log_item *dlog;
 
 			dlog = btrfs_item_ptr(eb, i, struct btrfs_dir_log_item);
-			printf("\t\tdir log end %Lu\n",
+			printf("\t\tdir log end %llu\n",
 			       (unsigned long long)btrfs_dir_log_end(eb, dlog));
 			break;
 			}
@@ -1337,6 +1549,9 @@ void btrfs_print_leaf(struct extent_buffer *eb)
 		case BTRFS_SHARED_DATA_REF_KEY:
 			print_shared_data_ref(eb, i);
 			break;
+		case BTRFS_EXTENT_OWNER_REF_KEY:
+			print_extent_owner_ref(eb, i);
+			break;
 		case BTRFS_EXTENT_REF_V0_KEY:
 			printf("\t\textent ref v0 (deprecated)\n");
 			break;
@@ -1344,11 +1559,10 @@ void btrfs_print_leaf(struct extent_buffer *eb)
 			printf("\t\tcsum item\n");
 			break;
 		case BTRFS_EXTENT_CSUM_KEY:
-			print_extent_csum(eb, fs_info, item_size,
-					offset);
+			print_extent_csum(eb, item_size, offset, ptr, print_csum_items);
 			break;
 		case BTRFS_EXTENT_DATA_KEY:
-			print_file_extent_item(eb, item, i, ptr);
+			print_file_extent_item(eb, i, ptr);
 			break;
 		case BTRFS_BLOCK_GROUP_ITEM_KEY:
 			print_block_group_item(eb, ptr);
@@ -1385,7 +1599,7 @@ void btrfs_print_leaf(struct extent_buffer *eb)
 		case BTRFS_UUID_KEY_SUBVOL:
 		case BTRFS_UUID_KEY_RECEIVED_SUBVOL:
 			print_uuid_item(eb, btrfs_item_ptr_offset(eb, i),
-					btrfs_item_size_nr(eb, i));
+					btrfs_item_size(eb, i));
 			break;
 		case BTRFS_STRING_ITEM_KEY: {
 			const char *str = eb->data + btrfs_item_ptr_offset(eb, i);
@@ -1399,6 +1613,12 @@ void btrfs_print_leaf(struct extent_buffer *eb)
 			break;
 		case BTRFS_TEMPORARY_ITEM_KEY:
 			print_temporary_item(eb, ptr, objectid, offset);
+			break;
+		case BTRFS_RAID_STRIPE_KEY:
+			print_raid_stripe_key(eb, item_size, ptr);
+			break;
+		case BTRFS_DEV_REPLACE_KEY:
+			print_dev_replace_item(eb, ptr);
 			break;
 		};
 		fflush(stdout);
@@ -1425,7 +1645,7 @@ static int search_leftmost_tree_block(struct btrfs_fs_info *fs_info,
 		struct extent_buffer *eb;
 
 		path->slots[i] = 0;
-		eb = read_node_slot(fs_info, path->nodes[i], 0);
+		eb = btrfs_read_node_slot(path->nodes[i], 0);
 		if (!extent_buffer_uptodate(eb)) {
 			ret = -EIO;
 			goto out;
@@ -1436,10 +1656,61 @@ out:
 	return ret;
 }
 
-static void bfs_print_children(struct extent_buffer *root_eb)
+/*
+ * Walk up the tree as far as necessary to find the next sibling tree block.
+ * More generic version of btrfs_next_leaf(), as it could find sibling nodes if
+ * @path->lowest_level is not 0.
+ *
+ * Returns 0 if it found something or 1 if there are no greater leaves.
+ * Returns < 0 on io errors.
+ */
+static int next_sibling_tree_block(struct btrfs_fs_info *fs_info,
+				   struct btrfs_path *path)
+{
+	int slot;
+	int level = path->lowest_level + 1;
+	struct extent_buffer *eb;
+	struct extent_buffer *next = NULL;
+
+	BUG_ON(path->lowest_level + 1 >= BTRFS_MAX_LEVEL);
+	do {
+		if (!path->nodes[level])
+			return 1;
+
+		slot = path->slots[level] + 1;
+		eb = path->nodes[level];
+		if (slot >= btrfs_header_nritems(eb)) {
+			level++;
+			if (level == BTRFS_MAX_LEVEL)
+				return 1;
+			continue;
+		}
+
+		next = btrfs_read_node_slot(eb, slot);
+		if (!extent_buffer_uptodate(next))
+			return -EIO;
+		break;
+	} while (level < BTRFS_MAX_LEVEL);
+	path->slots[level] = slot;
+	while(1) {
+		level--;
+		eb = path->nodes[level];
+		free_extent_buffer(eb);
+		path->nodes[level] = next;
+		path->slots[level] = 0;
+		if (level == path->lowest_level)
+			break;
+		next = btrfs_read_node_slot(next, 0);
+		if (!extent_buffer_uptodate(next))
+			return -EIO;
+	}
+	return 0;
+}
+
+static void bfs_print_children(struct extent_buffer *root_eb, unsigned int mode)
 {
 	struct btrfs_fs_info *fs_info = root_eb->fs_info;
-	struct btrfs_path path;
+	struct btrfs_path path = { 0 };
 	int root_level = btrfs_header_level(root_eb);
 	int cur_level;
 	int ret;
@@ -1447,7 +1718,10 @@ static void bfs_print_children(struct extent_buffer *root_eb)
 	if (root_level < 1)
 		return;
 
-	btrfs_init_path(&path);
+	mode &= ~(BTRFS_PRINT_TREE_FOLLOW);
+	mode |= BTRFS_PRINT_TREE_BFS;
+	mode &= ~(BTRFS_PRINT_TREE_DFS);
+
 	/* For path */
 	extent_buffer_get(root_eb);
 	path.nodes[root_level] = root_eb;
@@ -1462,9 +1736,8 @@ static void bfs_print_children(struct extent_buffer *root_eb)
 
 		/* Print all sibling tree blocks */
 		while (1) {
-			btrfs_print_tree(path.nodes[cur_level], 0,
-					 BTRFS_PRINT_TREE_BFS);
-			ret = btrfs_next_sibling_tree_block(fs_info, &path);
+			btrfs_print_tree(path.nodes[cur_level], mode);
+			ret = next_sibling_tree_block(fs_info, &path);
 			if (ret < 0)
 				goto out;
 			if (ret > 0) {
@@ -1478,7 +1751,7 @@ out:
 	return;
 }
 
-static void dfs_print_children(struct extent_buffer *root_eb)
+static void dfs_print_children(struct extent_buffer *root_eb, unsigned int mode)
 {
 	struct btrfs_fs_info *fs_info = root_eb->fs_info;
 	struct extent_buffer *next;
@@ -1486,9 +1759,18 @@ static void dfs_print_children(struct extent_buffer *root_eb)
 	int root_eb_level = btrfs_header_level(root_eb);
 	int i;
 
+	mode |= BTRFS_PRINT_TREE_FOLLOW;
+	mode |= BTRFS_PRINT_TREE_DFS;
+	mode &= ~(BTRFS_PRINT_TREE_BFS);
+
 	for (i = 0; i < nr; i++) {
+		struct btrfs_tree_parent_check check = {
+			.owner_root = btrfs_header_owner(root_eb),
+			.transid = btrfs_node_ptr_generation(root_eb, i),
+			.level = root_eb_level,
+		};
 		next = read_tree_block(fs_info, btrfs_node_blockptr(root_eb, i),
-				btrfs_node_ptr_generation(root_eb, i));
+				       &check);
 		if (!extent_buffer_uptodate(next)) {
 			fprintf(stderr, "failed to read %llu in tree %llu\n",
 				btrfs_node_blockptr(root_eb, i),
@@ -1504,12 +1786,18 @@ static void dfs_print_children(struct extent_buffer *root_eb)
 			free_extent_buffer(next);
 			continue;
 		}
-		btrfs_print_tree(next, 1, BTRFS_PRINT_TREE_DFS);
+		btrfs_print_tree(next, mode);
 		free_extent_buffer(next);
 	}
 }
 
-void btrfs_print_tree(struct extent_buffer *eb, bool follow, int traverse)
+/*
+ * Print a tree block (applies to both node and leaf).
+ *
+ * @eb:		tree block where to start
+ * @mode:	bits setting mode of operation, see BTRFS_PRINT_TREE_*
+ */
+void btrfs_print_tree(struct extent_buffer *eb, unsigned int mode)
 {
 	u32 i;
 	u32 nr;
@@ -1517,15 +1805,18 @@ void btrfs_print_tree(struct extent_buffer *eb, bool follow, int traverse)
 	struct btrfs_fs_info *fs_info = eb->fs_info;
 	struct btrfs_disk_key disk_key;
 	struct btrfs_key key;
+	const bool follow = (mode & BTRFS_PRINT_TREE_FOLLOW);
+	unsigned int traverse = BTRFS_PRINT_TREE_DEFAULT;
 
-	if (!eb)
-		return;
-	if (traverse != BTRFS_PRINT_TREE_DFS && traverse != BTRFS_PRINT_TREE_BFS)
-		traverse = BTRFS_PRINT_TREE_DEFAULT;
+	/* BFS is default and takes precedence if both are set */
+	if (mode & BTRFS_PRINT_TREE_DFS)
+		traverse = BTRFS_PRINT_TREE_DFS;
+	if (mode & BTRFS_PRINT_TREE_BFS)
+		traverse = BTRFS_PRINT_TREE_BFS;
 
 	nr = btrfs_header_nritems(eb);
 	if (btrfs_is_leaf(eb)) {
-		btrfs_print_leaf(eb);
+		__btrfs_print_leaf(eb, mode);
 		return;
 	}
 	/* We are crossing eb boundary, this node must be corrupted */
@@ -1533,7 +1824,7 @@ void btrfs_print_tree(struct extent_buffer *eb, bool follow, int traverse)
 		warning(
 		"node nr_items corrupted, has %u limit %u, continue anyway",
 			nr, BTRFS_NODEPTRS_PER_EXTENT_BUFFER(eb));
-	print_header_info(eb);
+	print_header_info(eb, mode);
 	ptr_num = BTRFS_NODEPTRS_PER_EXTENT_BUFFER(eb);
 	for (i = 0; i < nr && i < ptr_num; i++) {
 		u64 blocknr = btrfs_node_blockptr(eb, i);
@@ -1553,11 +1844,13 @@ void btrfs_print_tree(struct extent_buffer *eb, bool follow, int traverse)
 	if (follow && !fs_info)
 		return;
 
-	if (traverse == BTRFS_PRINT_TREE_DFS)
-		dfs_print_children(eb);
-	else
-		bfs_print_children(eb);
-	return;
+	/* Keep non-traversal modes */
+	mode &= ~(BTRFS_PRINT_TREE_DFS | BTRFS_PRINT_TREE_BFS);
+	if (traverse == BTRFS_PRINT_TREE_DFS) {
+		dfs_print_children(eb, mode);
+	} else {
+		bfs_print_children(eb, mode);
+	}
 }
 
 static bool is_valid_csum_type(u16 csum_type)
@@ -1577,7 +1870,7 @@ static int check_csum_sblock(void *sb, int csum_size, u16 csum_type)
 {
 	u8 result[BTRFS_CSUM_SIZE];
 
-	btrfs_csum_data(csum_type, (u8 *)sb + BTRFS_CSUM_SIZE,
+	btrfs_csum_data(NULL, csum_type, (u8 *)sb + BTRFS_CSUM_SIZE,
 			result, BTRFS_SUPER_INFO_SIZE - BTRFS_CSUM_SIZE);
 
 	return !memcmp(sb, result, csum_size);
@@ -1594,6 +1887,7 @@ struct readable_flag_entry {
 static struct readable_flag_entry compat_ro_flags_array[] = {
 	DEF_COMPAT_RO_FLAG_ENTRY(FREE_SPACE_TREE),
 	DEF_COMPAT_RO_FLAG_ENTRY(FREE_SPACE_TREE_VALID),
+	DEF_COMPAT_RO_FLAG_ENTRY(BLOCK_GROUP_TREE),
 };
 static const int compat_ro_flags_num = sizeof(compat_ro_flags_array) /
 				       sizeof(struct readable_flag_entry);
@@ -1614,6 +1908,10 @@ static struct readable_flag_entry incompat_flags_array[] = {
 	DEF_INCOMPAT_FLAG_ENTRY(NO_HOLES),
 	DEF_INCOMPAT_FLAG_ENTRY(METADATA_UUID),
 	DEF_INCOMPAT_FLAG_ENTRY(RAID1C34),
+	DEF_INCOMPAT_FLAG_ENTRY(ZONED),
+	DEF_INCOMPAT_FLAG_ENTRY(EXTENT_TREE_V2),
+	DEF_INCOMPAT_FLAG_ENTRY(RAID_STRIPE_TREE),
+	DEF_INCOMPAT_FLAG_ENTRY(SIMPLE_QUOTA),
 };
 static const int incompat_flags_num = sizeof(incompat_flags_array) /
 				      sizeof(struct readable_flag_entry);
@@ -1627,18 +1925,15 @@ static struct readable_flag_entry super_flags_array[] = {
 	DEF_HEADER_FLAG_ENTRY(WRITTEN),
 	DEF_HEADER_FLAG_ENTRY(RELOC),
 	DEF_SUPER_FLAG_ENTRY(CHANGING_FSID),
+	DEF_SUPER_FLAG_ENTRY(CHANGING_FSID_V2),
 	DEF_SUPER_FLAG_ENTRY(SEEDING),
 	DEF_SUPER_FLAG_ENTRY(METADUMP),
-	DEF_SUPER_FLAG_ENTRY(METADUMP_V2)
+	DEF_SUPER_FLAG_ENTRY(METADUMP_V2),
+	DEF_SUPER_FLAG_ENTRY(CHANGING_BG_TREE),
+	DEF_SUPER_FLAG_ENTRY(CHANGING_DATA_CSUM),
+	DEF_SUPER_FLAG_ENTRY(CHANGING_META_CSUM),
 };
 static const int super_flags_num = ARRAY_SIZE(super_flags_array);
-
-#define BTRFS_SUPER_FLAG_SUPP	(BTRFS_HEADER_FLAG_WRITTEN |\
-				 BTRFS_HEADER_FLAG_RELOC |\
-				 BTRFS_SUPER_FLAG_CHANGING_FSID |\
-				 BTRFS_SUPER_FLAG_SEEDING |\
-				 BTRFS_SUPER_FLAG_METADUMP |\
-				 BTRFS_SUPER_FLAG_METADUMP_V2)
 
 static void __print_readable_flag(u64 flag, struct readable_flag_entry *array,
 				  int array_size, u64 supported_flags)
@@ -1653,7 +1948,7 @@ static void __print_readable_flag(u64 flag, struct readable_flag_entry *array,
 	printf("\t\t\t( ");
 	for (i = 0; i < array_size; i++) {
 		entry = array + i;
-		if (flag & entry->bit) {
+		if ((flag & supported_flags) && (flag & entry->bit)) {
 			if (first)
 				printf("%s ", entry->output);
 			else
@@ -1673,28 +1968,33 @@ static void __print_readable_flag(u64 flag, struct readable_flag_entry *array,
 
 static void print_readable_compat_ro_flag(u64 flag)
 {
-	/*
-	 * We know about the FREE_SPACE_TREE{,_VALID} bits, but we don't
-	 * actually support them yet.
-	 */
+	u64 print_flags = 0;
+
+	for (int i = 0; i < compat_ro_flags_num; i++)
+		print_flags |= compat_ro_flags_array[i].bit;
 	return __print_readable_flag(flag, compat_ro_flags_array,
 				     compat_ro_flags_num,
-				     BTRFS_FEATURE_COMPAT_RO_SUPP |
-				     BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE |
-				     BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID);
+				     print_flags);
 }
 
 static void print_readable_incompat_flag(u64 flag)
 {
+	u64 print_flags = 0;
+
+	for (int i = 0; i < incompat_flags_num; i++)
+		print_flags |= incompat_flags_array[i].bit;
 	return __print_readable_flag(flag, incompat_flags_array,
-				     incompat_flags_num,
-				     BTRFS_FEATURE_INCOMPAT_SUPP);
+				     incompat_flags_num, print_flags);
 }
 
 static void print_readable_super_flag(u64 flag)
 {
+	u64 print_flags = 0;
+
+	for (int i = 0; i < super_flags_num; i++)
+		print_flags |= super_flags_array[i].bit;
 	return __print_readable_flag(flag, super_flags_array,
-				     super_flags_num, BTRFS_SUPER_FLAG_SUPP);
+				     super_flags_num, print_flags);
 }
 
 static void print_sys_chunk_array(struct btrfs_super_block *sb)
@@ -1711,9 +2011,9 @@ static void print_sys_chunk_array(struct btrfs_super_block *sb)
 	struct btrfs_key key;
 	int item;
 
-	buf = malloc(sizeof(*buf) + sizeof(*sb));
+	buf = alloc_dummy_extent_buffer(NULL, 0, BTRFS_SUPER_INFO_SIZE);
 	if (!buf) {
-		error("not enough memory");
+		error_msg(ERROR_MSG_MEMORY, NULL);
 		return;
 	}
 	write_extent_buffer(buf, sb, 0, sizeof(*sb));
@@ -1782,13 +2082,13 @@ static void print_sys_chunk_array(struct btrfs_super_block *sb)
 	}
 
 out:
-	free(buf);
+	free_extent_buffer(buf);
 	return;
 
 out_short_read:
 	error("sys_array too short to read %u bytes at offset %u",
 			len, cur_offset);
-	free(buf);
+	free_extent_buffer(buf);
 }
 
 static int empty_backup(struct btrfs_root_backup *backup)
@@ -1800,8 +2100,14 @@ static int empty_backup(struct btrfs_root_backup *backup)
 	return 0;
 }
 
-static void print_root_backup(struct btrfs_root_backup *backup)
+static void print_root_backup(struct btrfs_root_backup *backup,
+			      bool extent_tree_v2)
 {
+	const char *extent_tree_str = "backup_extent_root";
+
+	if (extent_tree_v2)
+		extent_tree_str = "backup_block_group_root";
+
 	printf("\t\tbackup_tree_root:\t%llu\tgen: %llu\tlevel: %d\n",
 			btrfs_backup_tree_root(backup),
 			btrfs_backup_tree_root_gen(backup),
@@ -1810,7 +2116,8 @@ static void print_root_backup(struct btrfs_root_backup *backup)
 			btrfs_backup_chunk_root(backup),
 			btrfs_backup_chunk_root_gen(backup),
 			btrfs_backup_chunk_root_level(backup));
-	printf("\t\tbackup_extent_root:\t%llu\tgen: %llu\tlevel: %d\n",
+	printf("\t\t%s:\t%llu\tgen: %llu\tlevel: %d\n",
+			extent_tree_str,
 			btrfs_backup_extent_root(backup),
 			btrfs_backup_extent_root_gen(backup),
 			btrfs_backup_extent_root_level(backup));
@@ -1822,7 +2129,7 @@ static void print_root_backup(struct btrfs_root_backup *backup)
 			btrfs_backup_dev_root(backup),
 			btrfs_backup_dev_root_gen(backup),
 			btrfs_backup_dev_root_level(backup));
-	printf("\t\tbackup_csum_root:\t%llu\tgen: %llu\tlevel: %d\n",
+	printf("\t\tcsum_root:\t%llu\tgen: %llu\tlevel: %d\n",
 			btrfs_backup_csum_root(backup),
 			btrfs_backup_csum_root_gen(backup),
 			btrfs_backup_csum_root_level(backup));
@@ -1840,12 +2147,14 @@ static void print_backup_roots(struct btrfs_super_block *sb)
 {
 	struct btrfs_root_backup *backup;
 	int i;
+	bool extent_tree_v2 = (btrfs_super_incompat_flags(sb) &
+		BTRFS_FEATURE_INCOMPAT_EXTENT_TREE_V2);
 
 	for (i = 0; i < BTRFS_NUM_BACKUP_ROOTS; i++) {
 		backup = sb->super_roots + i;
 		if (!empty_backup(backup)) {
 			printf("\tbackup %d:\n", i);
-			print_root_backup(backup);
+			print_root_backup(backup, extent_tree_v2);
 		}
 	}
 }
@@ -1902,12 +2211,8 @@ void btrfs_print_superblock(struct btrfs_super_block *sb, int full)
 
 	uuid_unparse(sb->fsid, buf);
 	printf("fsid\t\t\t%s\n", buf);
-	if (metadata_uuid_present) {
-		uuid_unparse(sb->metadata_uuid, buf);
-		printf("metadata_uuid\t\t%s\n", buf);
-	} else {
-		printf("metadata_uuid\t\t%s\n", buf);
-	}
+	uuid_unparse(sb->metadata_uuid, buf);
+	printf("metadata_uuid\t\t%s\n", buf);
 
 	printf("label\t\t\t");
 	s = sb->label;
@@ -1930,8 +2235,8 @@ void btrfs_print_superblock(struct btrfs_super_block *sb, int full)
 	       (unsigned long long)btrfs_super_chunk_root_level(sb));
 	printf("log_root\t\t%llu\n",
 	       (unsigned long long)btrfs_super_log_root(sb));
-	printf("log_root_transid\t%llu\n",
-	       (unsigned long long)btrfs_super_log_root_transid(sb));
+	printf("log_root_transid (deprecated)\t%llu\n",
+	       le64_to_cpu(sb->__unused_log_root_transid));
 	printf("log_root_level\t\t%llu\n",
 	       (unsigned long long)btrfs_super_log_root_level(sb));
 	printf("total_bytes\t\t%llu\n",

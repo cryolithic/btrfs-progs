@@ -11,13 +11,17 @@
  * General Public License for more details.
  *
  * You should have received a copy of the GNU General Public
- * License along with this program.
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
  */
 
 #ifndef __BTRFS_SEND_DUMP_H__
 #define __BTRFS_SEND_DUMP_H__
 
 #include <linux/limits.h>
+#include <limits.h>
+#include "common/send-stream.h"
 
 struct btrfs_dump_send_args {
 	char full_subvol_path[PATH_MAX];

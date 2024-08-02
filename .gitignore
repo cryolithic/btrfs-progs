@@ -3,13 +3,11 @@
 *.o.d
 
 /.cc-defines.h
-/version.h
+/libbtrfs/version.h
 /btrfs
 /btrfs.static
 /btrfs-map-logical
 /btrfs-map-logical.static
-/btrfs-fragments
-/btrfs-fragments.static
 /btrfsck
 /mkfs.btrfs
 /mkfs.btrfs.static
@@ -38,6 +36,7 @@
 
 /libbtrfsutil/libbtrfsutil.pc
 
+/fsstress
 /fssum
 /testsuite-id
 /tests/*-tests-results.txt
@@ -54,10 +53,12 @@
 /aclocal.m4
 /autom4te.cache
 /config.cache
-/config/*
-/config.h
-/config.h.in
-/config.h.in~
+/include/config.h
+/include/config.h.in
+/include/config.h.in~
+/config/config.guess
+/config/config.sub
+/config/install-sh
 /config.log
 /config.status
 /configure
@@ -71,36 +72,14 @@
 /cscope.po.out
 .*
 !.editorconfig
+!.github
+!.readthedocs.yaml
+!.codespellrc
 
 /ci/images/*/devel.tar.gz
 
 /Documentation/Makefile
-/Documentation/*.html
-/Documentation/btrfs-balance.8
-/Documentation/btrfs-check.8
-/Documentation/btrfs-convert.8
-/Documentation/btrfs-device.8
-/Documentation/btrfs-filesystem.8
-/Documentation/btrfs-find-root.8
-/Documentation/btrfs-image.8
-/Documentation/btrfs-inspect-internal.8
-/Documentation/btrfs-ioctl.3
-/Documentation/btrfs-man5.5
-/Documentation/btrfs-map-logical.8
-/Documentation/btrfs-property.8
-/Documentation/btrfs-qgroup.8
-/Documentation/btrfs-quota.8
-/Documentation/btrfs-receive.8
-/Documentation/btrfs-replace.8
-/Documentation/btrfs-rescue.8
-/Documentation/btrfs-restore.8
-/Documentation/btrfs-scrub.8
-/Documentation/btrfs-select-super.8
-/Documentation/btrfs-send.8
-/Documentation/btrfs-subvolume.8
-/Documentation/btrfs.8
-/Documentation/btrfstune.8
-/Documentation/fsck.btrfs.8
-/Documentation/mkfs.btrfs.8
+/Documentation/_build
+/Documentation/contents.rst
 
 *.patch

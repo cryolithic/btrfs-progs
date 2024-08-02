@@ -20,14 +20,24 @@
 #define __BTRFS_VOLUMES_H__
 
 #include "kerncompat.h"
+#include <stdbool.h>
+#include "kernel-lib/sizes.h"
 #include "kernel-shared/ctree.h"
+#include "kernel-shared/uapi/btrfs.h"
+#include "kernel-shared/uapi/btrfs_tree.h"
+#include "common/extent-cache.h"
+
+struct btrfs_trans_handle;
+struct extent_buffer;
 
 #define BTRFS_STRIPE_LEN	SZ_64K
+#define BTRFS_STRIPE_LEN_SHIFT	(16)
 
 struct btrfs_device {
 	struct list_head dev_list;
 	struct btrfs_root *dev_root;
 	struct btrfs_fs_devices *fs_devices;
+	struct btrfs_fs_info *fs_info;
 
 	u64 total_ios;
 
@@ -43,6 +53,8 @@ struct btrfs_device {
 	u64 super_bytes_used;
 
 	u64 generation;
+
+	struct btrfs_zoned_device_info *zone_info;
 
 	/* the internal btrfs device id */
 	u64 devid;
@@ -69,24 +81,38 @@ struct btrfs_device {
 	u8 uuid[BTRFS_UUID_SIZE];
 };
 
+enum btrfs_chunk_allocation_policy {
+	BTRFS_CHUNK_ALLOC_REGULAR,
+	BTRFS_CHUNK_ALLOC_ZONED,
+};
+
 struct btrfs_fs_devices {
 	u8 fsid[BTRFS_FSID_SIZE]; /* FS specific uuid */
 	u8 metadata_uuid[BTRFS_FSID_SIZE]; /* FS specific uuid */
 
 	/* the device with this id has the most recent copy of the super */
 	u64 latest_devid;
-	u64 latest_trans;
+	u64 latest_generation;
 	u64 lowest_devid;
 
+	u64 num_devices;
+	u64 missing_devices;
 	u64 total_rw_bytes;
 
+	u64 total_devices;
 	int latest_bdev;
 	int lowest_bdev;
 	struct list_head devices;
-	struct list_head list;
+	struct list_head fs_list;
 
-	int seeding;
 	struct btrfs_fs_devices *seed;
+
+	enum btrfs_chunk_allocation_policy chunk_alloc_policy;
+
+	bool changing_fsid;
+	bool active_metadata_uuid;
+	/* Super block data may be temporarily inconsistent (e.g. a different fsid). */
+	bool inconsistent_super;
 };
 
 struct btrfs_bio_stripe {
@@ -95,6 +121,7 @@ struct btrfs_bio_stripe {
 };
 
 struct btrfs_multi_bio {
+	u64 type;
 	int error;
 	int num_stripes;
 	struct btrfs_bio_stripe stripes[];
@@ -123,33 +150,13 @@ struct btrfs_raid_attr {
 	int nparity;		/* number of stripes worth of bytes to store
 				 * parity information */
 	int mindev_error;	/* error code if min devs requisite is unmet */
-	const char raid_name[8]; /* name of the raid */
+	const char lower_name[8]; /* name of the profile in lower case*/
+	const char upper_name[8]; /* name of the profile in upper case*/
 	u64 bg_flag;		/* block group flag of the raid */
 };
 
 extern const struct btrfs_raid_attr btrfs_raid_array[BTRFS_NR_RAID_TYPES];
-
-static inline enum btrfs_raid_types btrfs_bg_flags_to_raid_index(u64 flags)
-{
-	if (flags & BTRFS_BLOCK_GROUP_RAID10)
-		return BTRFS_RAID_RAID10;
-	else if (flags & BTRFS_BLOCK_GROUP_RAID1)
-		return BTRFS_RAID_RAID1;
-	else if (flags & BTRFS_BLOCK_GROUP_RAID1C3)
-		return BTRFS_RAID_RAID1C3;
-	else if (flags & BTRFS_BLOCK_GROUP_RAID1C4)
-		return BTRFS_RAID_RAID1C4;
-	else if (flags & BTRFS_BLOCK_GROUP_DUP)
-		return BTRFS_RAID_DUP;
-	else if (flags & BTRFS_BLOCK_GROUP_RAID0)
-		return BTRFS_RAID_RAID0;
-	else if (flags & BTRFS_BLOCK_GROUP_RAID5)
-		return BTRFS_RAID_RAID5;
-	else if (flags & BTRFS_BLOCK_GROUP_RAID6)
-		return BTRFS_RAID_RAID6;
-
-	return BTRFS_RAID_SINGLE; /* BTRFS_BLOCK_GROUP_SINGLE */
-}
+int btrfs_bg_type_to_nparity(u64 flags);
 
 #define btrfs_multi_bio_size(n) (sizeof(struct btrfs_multi_bio) + \
 			    (sizeof(struct btrfs_bio_stripe) * (n)))
@@ -232,12 +239,9 @@ static inline u64 calc_stripe_length(u64 type, u64 length, int num_stripes)
 	} else if (type & BTRFS_BLOCK_GROUP_RAID10) {
 		stripe_size = length * 2;
 		stripe_size /= num_stripes;
-	} else if (type & BTRFS_BLOCK_GROUP_RAID5) {
+	} else if (type & BTRFS_BLOCK_GROUP_RAID56_MASK) {
 		stripe_size = length;
-		stripe_size /= (num_stripes - 1);
-	} else if (type & BTRFS_BLOCK_GROUP_RAID6) {
-		stripe_size = length;
-		stripe_size /= (num_stripes - 2);
+		stripe_size /= (num_stripes - btrfs_bg_type_to_nparity(type));
 	} else {
 		stripe_size = length;
 	}
@@ -276,8 +280,8 @@ int btrfs_alloc_chunk(struct btrfs_trans_handle *trans,
 		      u64 *num_bytes, u64 type);
 int btrfs_alloc_data_chunk(struct btrfs_trans_handle *trans,
 			   struct btrfs_fs_info *fs_info, u64 *start, u64 num_bytes);
-int btrfs_open_devices(struct btrfs_fs_devices *fs_devices,
-		       int flags);
+int btrfs_open_devices(struct btrfs_fs_info *fs_info,
+		       struct btrfs_fs_devices *fs_devices, int flags);
 int btrfs_close_devices(struct btrfs_fs_devices *fs_devices);
 void btrfs_close_all_devices(void);
 int btrfs_insert_dev_extent(struct btrfs_trans_handle *trans,
@@ -305,10 +309,6 @@ int write_raid56_with_parity(struct btrfs_fs_info *info,
 			     struct extent_buffer *eb,
 			     struct btrfs_multi_bio *multi,
 			     u64 stripe_len, u64 *raid_map);
-int btrfs_check_chunk_valid(struct btrfs_fs_info *fs_info,
-			    struct extent_buffer *leaf,
-			    struct btrfs_chunk *chunk,
-			    int slot, u64 logical);
 u64 btrfs_stripe_length(struct btrfs_fs_info *fs_info,
 			struct extent_buffer *leaf,
 			struct btrfs_chunk *chunk);
@@ -316,4 +316,16 @@ int btrfs_fix_device_size(struct btrfs_fs_info *fs_info,
 			  struct btrfs_device *device);
 int btrfs_fix_super_size(struct btrfs_fs_info *fs_info);
 int btrfs_fix_device_and_super_size(struct btrfs_fs_info *fs_info);
+
+enum btrfs_raid_types btrfs_bg_flags_to_raid_index(u64 flags);
+int btrfs_bg_type_to_factor(u64 flags);
+const char *btrfs_bg_type_to_raid_name(u64 flags);
+int btrfs_bg_type_to_tolerated_failures(u64 flags);
+int btrfs_bg_type_to_devs_min(u64 flags);
+int btrfs_bg_type_to_ncopies(u64 flags);
+int btrfs_bg_type_to_nparity(u64 flags);
+int btrfs_bg_type_to_sub_stripes(u64 flags);
+u64 btrfs_bg_flags_for_device_num(int number);
+bool btrfs_bg_type_is_stripey(u64 flags);
+
 #endif

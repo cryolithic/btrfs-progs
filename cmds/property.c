@@ -14,19 +14,253 @@
  * Boston, MA 021110-1307, USA.
  */
 
-#include <stdlib.h>
-#include <string.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <fcntl.h>
+#include "kerncompat.h"
 #include <sys/ioctl.h>
 #include <sys/stat.h>
-
-#include "cmds/commands.h"
-#include "props.h"
-#include "kernel-shared/ctree.h"
+#include <sys/xattr.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <uuid/uuid.h>
+#include "libbtrfsutil/btrfsutil.h"
+#include "kernel-shared/uapi/btrfs.h"
+#include "kernel-shared/uapi/btrfs_tree.h"
+#include "common/defs.h"
+#include "common/messages.h"
+#include "common/open-utils.h"
 #include "common/utils.h"
 #include "common/help.h"
+#include "common/filesystem-utils.h"
+#include "cmds/commands.h"
+#include "cmds/props.h"
+
+#define XATTR_BTRFS_PREFIX     "btrfs."
+#define XATTR_BTRFS_PREFIX_LEN (sizeof(XATTR_BTRFS_PREFIX) - 1)
+
+/*
+ * Defined as synonyms in attr/xattr.h
+ */
+#ifndef ENOATTR
+#define ENOATTR ENODATA
+#endif
+
+static int subvolume_clear_received_uuid(const char *path)
+{
+	struct btrfs_ioctl_received_subvol_args args = {};
+	int ret;
+	int fd;
+
+	fd = open(path, O_RDONLY | O_NOATIME);
+	if (fd == -1)
+		return -errno;
+
+	ret = ioctl(fd, BTRFS_IOC_SET_RECEIVED_SUBVOL, &args);
+	if (ret == -1) {
+		close(fd);
+		return -errno;
+	}
+	close(fd);
+
+	return 0;
+}
+
+static int prop_read_only(enum prop_object_type type,
+			  const char *object,
+			  const char *name,
+			  const char *value,
+			  bool force)
+{
+	enum btrfs_util_error err;
+	bool read_only;
+
+	if (value) {
+		struct btrfs_util_subvolume_info info = {};
+		bool is_ro = false;
+		bool do_clear_received_uuid = false;
+
+		if (!strcmp(value, "true")) {
+			read_only = true;
+		} else if (!strcmp(value, "false")) {
+			read_only = false;
+		} else {
+			error("invalid value for property: %s", value);
+			return -EINVAL;
+		}
+		err = btrfs_util_get_subvolume_read_only(object, &is_ro);
+		if (err) {
+			error_btrfs_util(err);
+			return -errno;
+		}
+		/* No change if already read-only */
+		if (is_ro && read_only)
+			return 0;
+
+		err = btrfs_util_subvolume_info(object, 0, &info);
+		if (err)
+			warning("cannot read subvolume info");
+		if (is_ro && !uuid_is_null(info.received_uuid)) {
+			pr_verbose(LOG_INFO, "ro->rw switch but has set receive_uuid");
+
+			if (force) {
+				do_clear_received_uuid = true;
+			} else {
+				error(
+"cannot flip ro->rw with received_uuid set, use force option -f if you really want unset the read-only status."
+" The value of received_uuid is used for incremental send, consider making a snapshot instead."
+" Read more at btrfs-subvolume(8) and Subvolume flags.");
+				return -EPERM;
+			}
+		}
+		if (!is_ro && !uuid_is_null(info.received_uuid))
+			warning("read-write subvolume with received_uuid, this is bad");
+
+		err = btrfs_util_set_subvolume_read_only(object, read_only);
+		if (err) {
+			error_btrfs_util(err);
+			return -errno;
+		}
+		if (do_clear_received_uuid) {
+			int ret;
+			char uuid_str[BTRFS_UUID_UNPARSED_SIZE];
+
+			uuid_unparse(info.received_uuid, uuid_str);
+			pr_verbose(LOG_INFO, "force used, clearing received_uuid, previously %s",
+					uuid_str);
+			ret = subvolume_clear_received_uuid(object);
+			if (ret < 0)
+				warning("failed to clear received_uuid: %m");
+		}
+	} else {
+		err = btrfs_util_get_subvolume_read_only(object, &read_only);
+		if (err) {
+			error_btrfs_util(err);
+			return -errno;
+		}
+
+		pr_verbose(LOG_DEFAULT, "ro=%s\n", read_only ? "true" : "false");
+	}
+
+	return 0;
+}
+
+static int prop_label(enum prop_object_type type,
+		      const char *object,
+		      const char *name,
+		      const char *value,
+		      bool force)
+{
+	int ret;
+
+	if (value) {
+		ret = set_label((char *) object, (char *) value);
+	} else {
+		char label[BTRFS_LABEL_SIZE];
+
+		ret = get_label((char *) object, label);
+		if (!ret)
+			pr_verbose(LOG_DEFAULT, "label=%s\n", label);
+	}
+
+	return ret;
+}
+
+static int prop_compression(enum prop_object_type type,
+			    const char *object,
+			    const char *name,
+			    const char *value,
+			    bool force)
+{
+	int ret;
+	ssize_t sret;
+	int fd = -1;
+	char *buf = NULL;
+	char *xattr_name = NULL;
+	int open_flags = value ? O_RDWR : O_RDONLY;
+
+	fd = btrfs_open_path(object, open_flags == O_RDWR, false);
+	if (fd < 0) {
+		ret = fd;
+		goto out;
+	}
+
+	xattr_name = malloc(XATTR_BTRFS_PREFIX_LEN + strlen(name) + 1);
+	if (!xattr_name) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	memcpy(xattr_name, XATTR_BTRFS_PREFIX, XATTR_BTRFS_PREFIX_LEN);
+	memcpy(xattr_name + XATTR_BTRFS_PREFIX_LEN, name, strlen(name));
+	xattr_name[XATTR_BTRFS_PREFIX_LEN + strlen(name)] = '\0';
+
+	if (value) {
+		sret = fsetxattr(fd, xattr_name, value, strlen(value), 0);
+	} else {
+		sret = fgetxattr(fd, xattr_name, NULL, 0);
+	}
+	if (sret < 0) {
+		ret = -errno;
+		if (ret != -ENOATTR)
+			error("failed to %s compression for %s: %m",
+			      value ? "set" : "get", object);
+		else
+			ret = 0;
+		goto out;
+	}
+	if (!value) {
+		size_t len = sret;
+
+		buf = malloc(len);
+		if (!buf) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		sret = fgetxattr(fd, xattr_name, buf, len);
+		if (sret < 0) {
+			ret = -errno;
+			error("failed to get compression for %s: %m", object);
+			goto out;
+		}
+		pr_verbose(LOG_DEFAULT, "compression=%.*s\n", (int)len, buf);
+	}
+
+	ret = 0;
+out:
+	free(xattr_name);
+	free(buf);
+	if (fd >= 0)
+		close(fd);
+
+	return ret;
+}
+
+const struct prop_handler prop_handlers[] = {
+	{
+		.name ="ro",
+		.desc = "read-only status of a subvolume",
+		.read_only = 0,
+		.types = prop_object_subvol,
+	 	.handler = prop_read_only
+	},
+	{
+		.name = "label",
+		.desc = "label of the filesystem",
+		.read_only = 0,
+		.types = prop_object_dev | prop_object_root,
+		.handler = prop_label
+	},
+	{
+		.name = "compression",
+		.desc = "compression algorithm for the file or directory",
+		.read_only = 0,
+		.types = prop_object_inode,
+		.handler = prop_compression
+	},
+	{NULL, NULL, 0, 0, NULL}
+};
 
 static const char * const property_cmd_group_usage[] = {
 	"btrfs property get/set/list [-t <type>] <object> [<name>] [value]",
@@ -52,6 +286,19 @@ static int check_btrfs_object(const char *object)
 {
 	int ret;
 	u8 fsid[BTRFS_FSID_SIZE];
+	struct stat st;
+
+	ret = stat(object, &st);
+	if (ret < 0)
+		return 0;
+
+	/*
+	 * Don't try to read fsid on char devices, this will fail anyway. In
+	 * some cases opening the device can trigger some system events (like a
+	 * watchdog) so do only stat.
+	 */
+	if ((st.st_mode & S_IFMT) == S_IFCHR || (st.st_mode & S_IFMT) == S_IFIFO)
+		return 0;
 
 	ret = get_fsid(object, fsid, 0);
 	if (ret < 0)
@@ -144,7 +391,7 @@ static int autodetect_object_types(const char *object, int *types_out)
 
 	is_btrfs_object = check_btrfs_object(object);
 
-	ret = lstat(object, &st);
+	ret = stat(object, &st);
 	if (ret < 0) {
 		ret = -errno;
 		goto out;
@@ -182,9 +429,9 @@ static int dump_prop(const struct prop_handler *prop,
 
 	if ((types & type) && (prop->types & type)) {
 		if (!name_and_help)
-			ret = prop->handler(type, object, prop->name, NULL);
+			ret = prop->handler(type, object, prop->name, NULL, false);
 		else
-			printf("%-20s%s\n", prop->name, prop->desc);
+			pr_verbose(LOG_DEFAULT, "%-20s%s\n", prop->name, prop->desc);
 	}
 	return ret;
 }
@@ -214,7 +461,7 @@ out:
 }
 
 static int setget_prop(int types, const char *object,
-		       const char *name, const char *value)
+		       const char *name, const char *value, bool force)
 {
 	int ret;
 	const struct prop_handler *prop = NULL;
@@ -242,7 +489,7 @@ static int setget_prop(int types, const char *object,
 		return 1;
 	}
 
-	ret = prop->handler(types, object, name, value);
+	ret = prop->handler(types, object, name, value, force);
 
 	if (ret < 0)
 		ret = 1;
@@ -255,19 +502,26 @@ static int setget_prop(int types, const char *object,
 
 static int parse_args(const struct cmd_struct *cmd, int argc, char **argv,
 		       int *types, char **object,
-		       char **name, char **value, int min_nonopt_args)
+		       char **name, char **value, int min_nonopt_args,
+		       bool *force)
 {
 	int ret;
 	char *type_str = NULL;
 	int max_nonopt_args = 1;
 
+	*force = false;
+
 	optind = 1;
 	while (1) {
-		int c = getopt(argc, argv, "t:");
+		int c = getopt(argc, argv, "ft:");
 		if (c < 0)
 			break;
 
 		switch (c) {
+		case 'f':
+			/* TODO: do not accept for get/list */
+			*force = true;
+			break;
 		case 't':
 			type_str = optarg;
 			break;
@@ -334,13 +588,12 @@ static const char * const cmd_property_get_usage[] = {
 	"A filesystem object can be the filesystem itself, a subvolume,",
 	"an inode or a device. The option -t can be used to explicitly",
 	"specify what type of object you meant. This is only needed when a",
-	"property could be set for more then one object type.",
+	"property could be set for more than one object type.",
 	"",
 	"Possible values for type are: inode, subvol, filesystem, device.",
 	"They can be abbreviated to the first letter, i/s/f/d",
 	"",
-	"-t <TYPE>       list properties for the given object type (inode, subvol,",
-	"                filesystem, device)",
+	OPTLINE("-t <TYPE>", "list properties for the given object type (inode, subvol, filesystem, device)"),
 	NULL
 };
 
@@ -351,12 +604,13 @@ static int cmd_property_get(const struct cmd_struct *cmd,
 	char *object = NULL;
 	char *name = NULL;
 	int types = 0;
+	bool force;
 
-	if (parse_args(cmd, argc, argv, &types, &object, &name, NULL, 1))
+	if (parse_args(cmd, argc, argv, &types, &object, &name, NULL, 1, &force))
 		return 1;
 
 	if (name)
-		ret = setget_prop(types, object, name, NULL);
+		ret = setget_prop(types, object, name, NULL, force);
 	else
 		ret = dump_props(types, object, 0);
 
@@ -365,13 +619,13 @@ static int cmd_property_get(const struct cmd_struct *cmd,
 static DEFINE_SIMPLE_COMMAND(property_get, "get");
 
 static const char * const cmd_property_set_usage[] = {
-	"btrfs property set [-t <type>] <object> <name> <value>",
+	"btrfs property set [-f] [-t <type>] <object> <name> <value>",
 	"Set a property on a btrfs object",
 	"Set a property on a btrfs object where object is a path to file or",
 	"directory and can also represent the filesystem or device based on the type",
 	"",
-	"-t <TYPE>       list properties for the given object type (inode, subvol,",
-	"                filesystem, device)",
+	OPTLINE("-t <TYPE>", "list properties for the given object type (inode, subvol, filesystem, device)"),
+	OPTLINE("-f", "force the change, could potentially break something"),
 	NULL
 };
 
@@ -383,11 +637,12 @@ static int cmd_property_set(const struct cmd_struct *cmd,
 	char *name = NULL;
 	char *value = NULL;
 	int types = 0;
+	bool force = false;
 
-	if (parse_args(cmd, argc, argv, &types, &object, &name, &value, 3))
+	if (parse_args(cmd, argc, argv, &types, &object, &name, &value, 3, &force))
 		return 1;
 
-	ret = setget_prop(types, object, name, value);
+	ret = setget_prop(types, object, name, value, force);
 
 	return ret;
 }
@@ -400,8 +655,7 @@ static const char * const cmd_property_list_usage[] = {
 	"See the help of 'btrfs property get' for a description of",
 	"objects and object types.",
 	"",
-	"-t <TYPE>       list properties for the given object type (inode, subvol,",
-	"                filesystem, device)",
+	OPTLINE("-t <TYPE>", "list properties for the given object type (inode, subvol, filesystem, device)"),
 	NULL
 };
 
@@ -411,8 +665,9 @@ static int cmd_property_list(const struct cmd_struct *cmd,
 	int ret;
 	char *object = NULL;
 	int types = 0;
+	bool force;
 
-	if (parse_args(cmd, argc, argv, &types, &object, NULL, NULL, 1))
+	if (parse_args(cmd, argc, argv, &types, &object, NULL, NULL, 1, &force))
 		return 1;
 
 	ret = dump_props(types, object, 1);

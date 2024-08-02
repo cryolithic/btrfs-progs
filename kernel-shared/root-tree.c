@@ -16,10 +16,17 @@
  * Boston, MA 021110-1307, USA.
  */
 
+#include "kerncompat.h"
+#include <errno.h>
+#include <string.h>
+#include "kernel-lib/bitops.h"
+#include "kernel-shared/accessors.h"
+#include "kernel-shared/messages.h"
+#include "kernel-shared/extent_io.h"
+#include "kernel-shared/uapi/btrfs_tree.h"
 #include "kernel-shared/ctree.h"
-#include "kernel-shared/transaction.h"
 #include "kernel-shared/disk-io.h"
-#include "kernel-shared/print-tree.h"
+#include "kernel-shared/transaction.h"
 
 int btrfs_find_last_root(struct btrfs_root *root, u64 objectid,
 			struct btrfs_root_item *item, struct btrfs_key *key)
@@ -69,6 +76,7 @@ int btrfs_update_root(struct btrfs_trans_handle *trans, struct btrfs_root
 		      *root, struct btrfs_key *key, struct btrfs_root_item
 		      *item)
 {
+	struct btrfs_fs_info *fs_info = root->fs_info;
 	struct btrfs_path *path;
 	struct extent_buffer *l;
 	int ret;
@@ -83,11 +91,21 @@ int btrfs_update_root(struct btrfs_trans_handle *trans, struct btrfs_root
 	ret = btrfs_search_slot(trans, root, key, path, 0, 1);
 	if (ret < 0)
 		goto out;
-	BUG_ON(ret != 0);
+
+	if (ret > 0) {
+		btrfs_crit(fs_info,
+			"unable to find root key (%llu %u %llu) in tree %llu",
+			key->objectid, key->type, key->offset,
+			root->root_key.objectid);
+		ret = -EUCLEAN;
+		btrfs_abort_transaction(trans, ret);
+		goto out;
+	}
+
 	l = path->nodes[0];
 	slot = path->slots[0];
 	ptr = btrfs_item_ptr_offset(l, slot);
-	old_len = btrfs_item_size_nr(l, slot);
+	old_len = btrfs_item_size(l, slot);
 
 	/*
 	 * If this is the first time we update the root item which originated
@@ -99,17 +117,20 @@ int btrfs_update_root(struct btrfs_trans_handle *trans, struct btrfs_root
 		ret = btrfs_search_slot(trans, root, key, path,
 				-1, 1);
 		if (ret < 0) {
+			btrfs_abort_transaction(trans, ret);
 			goto out;
 		}
 
 		ret = btrfs_del_item(trans, root, path);
 		if (ret < 0) {
+			btrfs_abort_transaction(trans, ret);
 			goto out;
 		}
 		btrfs_release_path(path);
 		ret = btrfs_insert_empty_item(trans, root, path,
 				key, sizeof(*item));
 		if (ret < 0) {
+			btrfs_abort_transaction(trans, ret);
 			goto out;
 		}
 		l = path->nodes[0];
@@ -194,7 +215,6 @@ int btrfs_add_root_ref(struct btrfs_trans_handle *trans,
 	struct btrfs_root_ref *ref;
 	struct extent_buffer *leaf;
 	unsigned long ptr;
-
 
 	path = btrfs_alloc_path();
 	if (!path)

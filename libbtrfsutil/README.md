@@ -39,7 +39,7 @@ enum btrfs_util_err err;
 
 err = btrfs_util_sync("/");
 if (err)
-	fprintf("stderr, %s: %m\n", btrfs_util_strerror(err));
+	fprintf(stderr, "%s: %m\n", btrfs_util_strerror(err));
 ```
 
 In the Python bindings, functions may raise a `BtrfsUtilError`, which is a
@@ -245,8 +245,7 @@ The equivalent `btrfs-progs` command is `btrfs subvolume list`.
 #### Creation
 
 `btrfs_util_create_subvolume()` creates a new subvolume at the given path. The
-subvolume can be created asynchronously and inherit from quota groups
-(qgroups).
+subvolume can inherit from quota groups (qgroups).
 
 Qgroups to inherit are specified with a `struct btrfs_util_qgroup_inherit`,
 which is created by `btrfs_util_create_qgroup_inherit()` and freed by
@@ -262,10 +261,6 @@ method and a `groups` member, which is a list of ints.
 ```c
 btrfs_util_create_subvolume("/subvol2", 0, NULL, NULL);
 
-uint64_t async_transid;
-btrfs_util_create_subvolume("/subvol2", 0, &async_transid, NULL);
-btrfs_util_wait_sync("/", async_transid);
-
 struct btrfs_util_qgroup_inherit *qgroups;
 btrfs_util_create_qgroup_inherit(0, &qgroups);
 btrfs_util_qgroup_inherit_add_group(&qgroups, 256);
@@ -275,9 +270,6 @@ btrfs_util_destroy_qgroup_inherit(qgroups);
 
 ```python
 btrfsutil.create_subvolume('/subvol2')
-
-async_transid = btrfsutil.create_subvolume('/subvol2', async_=True)
-btrfsutil.wait_sync('/', async_transid)
 
 qgroups = btrfsutil.QgroupInherit()
 qgroups.add_group(256)
@@ -292,8 +284,8 @@ The equivalent `btrfs-progs` command is `btrfs subvolume create`.
 #### Snapshotting
 
 Snapshots are created with `btrfs_util_create_snapshot()`, which takes a source
-path, a destination path, and flags. It can also be asynchronous and inherit
-from quota groups; see [subvolume creation](#Creation).
+path, a destination path, and flags. It can also inherit from quota groups;
+see [subvolume creation](#Creation).
 
 Snapshot creation can be recursive, in which case subvolumes underneath the
 subvolume being snapshotted will also be snapshotted onto the same location in
@@ -456,3 +448,51 @@ A few guidelines:
   the library major version if we don't have to)
 * Include Python bindings for all interfaces
 * Write tests for all interfaces
+
+### Extending API
+
+Adding a new function to the API requires updating several locations scattered
+everywhere. The following checklist should help to make sure nothing is missing:
+
+* `libbtrfsutil/btrfsutil.h` add exported functions, with proper documentation
+  following examples of the others (documented parameters, behaviour, return
+  values, other relevant information/quirks)
+* `libbtrfsutil/btrfsutil.h` add any new error 'btrfs\_util\_error' enums
+  specific to the added functions and in `libbtrfsutil/errors.c` write text
+  descriptions
+* `libbtrfsutil/btrfsutil.h` add new constants if necessary, new values must be
+  defined even if there's already an existing one in another 'btrfs-progs' header,
+  prefix them with 'BTRFS\_UTIL\_'
+* implementation goes to `*.c`, existing one if the class of the API already
+  exists or create a new one, in that case update `Makefile` and variable
+  'libbtrfsutil\_objects'
+* `libbtrfsutil.sym` add new exported symbols, add a new versioned section if
+  necessary, bump minor version
+* `python/btrfsutilpy.h` declare C functions implementing the binding
+* `python/*.c` add the implementation, filenames follow the library '\*.c',
+  follow examples of other functions how the bindings are done, this can be the
+  hard part in case there are non-trivial return values
+* `python/module.c` add binding description entry for the new functions
+* `python/tests/test_*.py` write test for the new functionality
+* `README.md` add documentation for the new functions
+
+### API summary
+
+* filesystem
+  * sync
+  * wait for sync
+* subvolume
+  * create
+  * delete
+  * is subvolume
+  * get containing subvolume id
+  * get path of id
+  * get info
+  * set/get default
+  * set/get read-only flag
+  * list (live and deleted)
+* qgroups
+  * create
+  * inherit
+  * add relation
+  * destroy

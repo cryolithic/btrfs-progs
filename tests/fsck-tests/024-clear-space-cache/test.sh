@@ -1,7 +1,7 @@
 #!/bin/bash
 # confirm that clearing space cache works
 
-source "$TEST_TOP/common"
+source "$TEST_TOP/common" || exit
 
 check_prereq btrfs
 check_prereq mkfs.btrfs
@@ -23,7 +23,7 @@ sync
 
 # Remove file 1 3 5 to create holes
 for i in 1 3 5; do
-	run_check $SUDO_HELPER rm "$TEST_MNT/file_${i}"
+	run_check $SUDO_HELPER rm "$TEST_MNT/file_$i"
 done
 
 sync
@@ -36,7 +36,7 @@ run_check "$TOP/btrfs" check "$TEST_DEV"
 
 # Manually recheck space cache and super space cache generation
 run_check_stdout "$TOP/btrfs" inspect-internal dump-tree -t root "$TEST_DEV" | \
-	grep -q FREE_SPACE
+	grep -q -w FREE_SPACE
 if [ $? -eq 0 ]; then
 	_fail "clear space cache doesn't clear all space cache"
 fi

@@ -17,15 +17,22 @@
  */
 
 #include "kerncompat.h"
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kernel-lib/bitops.h"
+#include "kernel-lib/rbtree.h"
+#include "kernel-lib/sizes.h"
 #include "kernel-shared/ctree.h"
+#include "kernel-shared/accessors.h"
+#include "kernel-shared/uapi/btrfs_tree.h"
 #include "kernel-shared/free-space-cache.h"
 #include "kernel-shared/transaction.h"
-#include "kernel-shared/disk-io.h"
 #include "kernel-shared/extent_io.h"
 #include "crypto/crc32c.h"
-#include "kernel-lib/bitops.h"
 #include "common/internal.h"
-#include "common/utils.h"
+#include "common/messages.h"
 
 /*
  * Kernel always uses PAGE_CACHE_SIZE for sectorsize, but we don't have
@@ -112,12 +119,14 @@ static int io_ctl_prepare_pages(struct io_ctl *io_ctl, struct btrfs_root *root,
 	if (ret) {
 		fprintf(stderr,
 		       "Couldn't find file extent item for free space inode"
-		       " %Lu\n", ino);
+		       " %llu\n", ino);
 		btrfs_release_path(path);
 		return -EINVAL;
 	}
 
 	while (total_read < io_ctl->total_size) {
+		u64 offset = 0;
+
 		if (path->slots[0] >= btrfs_header_nritems(path->nodes[0])) {
 			ret = btrfs_next_leaf(root, path);
 			if (ret) {
@@ -150,11 +159,19 @@ static int io_ctl_prepare_pages(struct io_ctl *io_ctl, struct btrfs_root *root,
 		bytenr = btrfs_file_extent_disk_bytenr(leaf, fi) +
 			btrfs_file_extent_offset(leaf, fi);
 		len = btrfs_file_extent_num_bytes(leaf, fi);
-		ret = read_data_from_disk(root->fs_info,
-					  io_ctl->buffer + key.offset, bytenr,
-					  len, 0);
-		if (ret)
-			break;
+		while (offset < len) {
+			u64 read_len = len - offset;
+
+			ret = read_data_from_disk(root->fs_info,
+					  io_ctl->buffer + key.offset + offset,
+					  bytenr + offset,
+					  &read_len, 0);
+			if (ret < 0) {
+				btrfs_release_path(path);
+				return ret;
+			}
+			offset += read_len;
+		}
 		total_read += len;
 		path->slots[0]++;
 	}
@@ -183,7 +200,7 @@ static int io_ctl_check_generation(struct io_ctl *io_ctl, u64 generation)
 	gen = io_ctl->cur;
 	if (le64_to_cpu(*gen) != generation) {
 		printk("btrfs: space cache generation "
-		       "(%Lu) does not match inode (%Lu)\n", *gen,
+		       "(%llu) does not match inode (%llu)\n", *gen,
 		       generation);
 		io_ctl_unmap_page(io_ctl);
 		return -EIO;
@@ -289,8 +306,8 @@ static int __load_free_space_cache(struct btrfs_root *root,
 	INIT_LIST_HEAD(&bitmaps);
 
 	key.objectid = BTRFS_FREE_SPACE_OBJECTID;
-	key.offset = offset;
 	key.type = 0;
+	key.offset = offset;
 
 	ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
 	if (ret < 0) {
@@ -366,12 +383,12 @@ static int __load_free_space_cache(struct btrfs_root *root,
 
 		ret = io_ctl_read_entry(&io_ctl, e, &type);
 		if (ret) {
-			free(e);
+			kfree(e);
 			goto free_cache;
 		}
 
 		if (!e->bytes) {
-			free(e);
+			kfree(e);
 			goto free_cache;
 		}
 
@@ -380,7 +397,7 @@ static int __load_free_space_cache(struct btrfs_root *root,
 			if (ret) {
 				fprintf(stderr,
 				       "Duplicate entries in free space cache\n");
-				free(e);
+				kfree(e);
 				goto free_cache;
 			}
 		} else {
@@ -388,7 +405,7 @@ static int __load_free_space_cache(struct btrfs_root *root,
 			num_bitmaps--;
 			e->bitmap = kzalloc(ctl->sectorsize, GFP_NOFS);
 			if (!e->bitmap) {
-				free(e);
+				kfree(e);
 				goto free_cache;
 			}
 			ret = link_free_space(ctl, e);
@@ -396,8 +413,8 @@ static int __load_free_space_cache(struct btrfs_root *root,
 			if (ret) {
 				fprintf(stderr,
 				       "Duplicate entries in free space cache\n");
-				free(e->bitmap);
-				free(e);
+				kfree(e->bitmap);
+				kfree(e);
 				goto free_cache;
 			}
 			list_add_tail(&e->list, &bitmaps);
@@ -754,7 +771,7 @@ static void try_merge_free_space(struct btrfs_free_space_ctl *ctl,
 	if (right_info && !right_info->bitmap) {
 		unlink_free_space(ctl, right_info);
 		info->bytes += right_info->bytes;
-		free(right_info);
+		kfree(right_info);
 	}
 
 	if (left_info && !left_info->bitmap &&
@@ -762,7 +779,7 @@ static void try_merge_free_space(struct btrfs_free_space_ctl *ctl,
 		unlink_free_space(ctl, left_info);
 		info->offset = left_info->offset;
 		info->bytes += left_info->bytes;
-		free(left_info);
+		kfree(left_info);
 	}
 }
 
@@ -812,8 +829,8 @@ void __btrfs_remove_free_space_cache(struct btrfs_free_space_ctl *ctl)
 	while ((node = rb_last(&ctl->free_space_offset)) != NULL) {
 		info = rb_entry(node, struct btrfs_free_space, offset_index);
 		unlink_free_space(ctl, info);
-		free(info->bitmap);
-		free(info);
+		kfree(info->bitmap);
+		kfree(info);
 	}
 }
 
@@ -876,8 +893,8 @@ again:
 					break;
 				bytes = ctl->unit;
 			}
-			free(e->bitmap);
-			free(e);
+			kfree(e->bitmap);
+			kfree(e);
 			goto again;
 		}
 		if (!prev)
@@ -886,7 +903,7 @@ again:
 			unlink_free_space(ctl, prev);
 			unlink_free_space(ctl, e);
 			prev->bytes += e->bytes;
-			free(e);
+			kfree(e);
 			link_free_space(ctl, prev);
 			goto again;
 		}
@@ -895,12 +912,12 @@ next:
 	}
 }
 
-int btrfs_clear_free_space_cache(struct btrfs_fs_info *fs_info,
+int btrfs_clear_free_space_cache(struct btrfs_trans_handle *trans,
 				 struct btrfs_block_group *bg)
 {
-	struct btrfs_trans_handle *trans;
+	struct btrfs_fs_info *fs_info = trans->fs_info;
 	struct btrfs_root *tree_root = fs_info->tree_root;
-	struct btrfs_path path;
+	struct btrfs_path path = { 0 };
 	struct btrfs_key key;
 	struct btrfs_disk_key location;
 	struct btrfs_free_space_header *sc_header;
@@ -908,12 +925,6 @@ int btrfs_clear_free_space_cache(struct btrfs_fs_info *fs_info,
 	u64 ino;
 	int slot;
 	int ret;
-
-	trans = btrfs_start_transaction(tree_root, 1);
-	if (IS_ERR(trans))
-		return PTR_ERR(trans);
-
-	btrfs_init_path(&path);
 
 	key.objectid = BTRFS_FREE_SPACE_OBJECTID;
 	key.type = 0;
@@ -976,9 +987,8 @@ int btrfs_clear_free_space_cache(struct btrfs_fs_info *fs_info,
 		disk_bytenr = btrfs_file_extent_disk_bytenr(node, fi);
 		disk_num_bytes = btrfs_file_extent_disk_num_bytes(node, fi);
 
-		ret = btrfs_free_extent(trans, tree_root, disk_bytenr,
-					disk_num_bytes, 0, tree_root->objectid,
-					ino, key.offset);
+		ret = btrfs_free_extent(trans, disk_bytenr, disk_num_bytes, 0,
+					tree_root->objectid, ino, key.offset);
 		if (ret < 0) {
 			error("failed to remove backref for disk bytenr %llu: %d",
 			      disk_bytenr, ret);
@@ -1016,7 +1026,5 @@ int btrfs_clear_free_space_cache(struct btrfs_fs_info *fs_info,
 	}
 out:
 	btrfs_release_path(&path);
-	if (!ret)
-		btrfs_commit_transaction(trans, tree_root);
 	return ret;
 }

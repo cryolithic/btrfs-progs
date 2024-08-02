@@ -17,20 +17,13 @@
  */
 
 #if BTRFS_FLAT_INCLUDES
-#include "kerncompat.h"
-#include "version.h"
+#include "libbtrfs/kerncompat.h"
+#include "libbtrfs/version.h"
+#include "libbtrfs/ioctl.h"
 #include "kernel-lib/rbtree.h"
-#include "kernel-lib/radix-tree.h"
-#include "crypto/crc32c.h"
 #include "kernel-lib/list.h"
-#include "kernel-lib/sizes.h"
 #include "kernel-shared/ctree.h"
-#include "kernel-shared/extent_io.h"
-#include "ioctl.h"
-#include "btrfs-list.h"
-#include "check/btrfsck.h"
-#include "common/extent-cache.h"
-#include "send.h"
+#include "kernel-shared/send.h"
 #include "common/send-stream.h"
 #include "common/send-utils.h"
 #else
@@ -41,16 +34,9 @@
 #include "btrfs/kerncompat.h"
 #include "btrfs/version.h"
 #include "btrfs/rbtree.h"
-#include "btrfs/radix-tree.h"
-#include "btrfs/crc32c.h"
 #include "btrfs/list.h"
-#include "btrfs/sizes.h"
 #include "btrfs/ctree.h"
-#include "btrfs/extent_io.h"
 #include "btrfs/ioctl.h"
-#include "btrfs/btrfs-list.h"
-#include "btrfs/btrfsck.h"
-#include "btrfs/extent-cache.h"
 #include "btrfs/send.h"
 #include "btrfs/send-stream.h"
 #include "btrfs/send-utils.h"
@@ -98,15 +84,26 @@ static int test_send_stream_api() {
 	return ret;
 }
 
-static int test_list_rootid() {
-	u64 treeid;
+static int test_uuid_search() {
+	struct subvol_uuid_search sus = {};
+	u8 uuid[BTRFS_FSID_SIZE] = {};
 
-	return btrfs_list_get_path_rootid(-1, &treeid);
+	subvol_uuid_search_init(-1, &sus);
+	subvol_uuid_search(&sus, 0, uuid, -1, "/", subvol_search_by_path);
+	return 0;
+}
+
+static int test_subvolid_resolve() {
+	char path[4096] = "/";
+
+	btrfs_subvolid_resolve(-1, path, strlen(path), 0);
+	return 0;
 }
 
 int main() {
 	test_send_stream_api();
-	test_list_rootid();
+	test_uuid_search();
+	test_subvolid_resolve();
 
 	return 0;
 }

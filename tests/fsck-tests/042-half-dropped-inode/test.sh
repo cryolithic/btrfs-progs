@@ -9,7 +9,7 @@
 #
 # The way to reproduce the image:
 # - Create a lot of regular file extents for one inode
-#   Using direct IO with small block size is the easiy method
+#   Using direct IO with small block size is the easy method
 # - Modify kernel to commit transaction more aggressively
 #   Two locations are needed:
 #   * btrfs_unlink():
@@ -23,7 +23,7 @@
 # - Sync the fs
 # - Replay the log
 
-source "$TEST_TOP/common"
+source "$TEST_TOP/common" || exit
 
 check_prereq btrfs
 

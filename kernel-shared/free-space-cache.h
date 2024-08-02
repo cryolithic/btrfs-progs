@@ -20,8 +20,13 @@
 #define __BTRFS_FREE_SPACE_CACHE_H__
 
 #include "kerncompat.h"
-#include "kernel-shared/ctree.h"
-#include "kernel-lib/rbtree.h"
+#include "kernel-lib/bitops.h"
+#include "kernel-lib/list.h"
+#include "kernel-lib/rbtree_types.h"
+
+struct btrfs_block_group;
+struct btrfs_fs_info;
+struct btrfs_trans_handle;
 
 struct btrfs_free_space {
 	struct rb_node offset_index;
@@ -57,6 +62,6 @@ void unlink_free_space(struct btrfs_free_space_ctl *ctl,
 		       struct btrfs_free_space *info);
 int btrfs_add_free_space(struct btrfs_free_space_ctl *ctl, u64 offset,
 			 u64 bytes);
-int btrfs_clear_free_space_cache(struct btrfs_fs_info *fs_info,
+int btrfs_clear_free_space_cache(struct btrfs_trans_handle *trans,
 				 struct btrfs_block_group *bg);
 #endif

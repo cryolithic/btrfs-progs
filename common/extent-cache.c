@@ -15,9 +15,11 @@
  * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
  * Boston, MA 021110-1307, USA.
  */
+
+#include "kerncompat.h"
 #include <stdio.h>
 #include <stdlib.h>
-#include "kerncompat.h"
+#include <errno.h>
 #include "common/extent-cache.h"
 #include "common/rbtree-utils.h"
 
@@ -27,12 +29,12 @@ struct cache_extent_search_range {
 	u64 size;
 };
 
-static int cache_tree_comp_range(struct rb_node *node, void *data)
+static int cache_tree_comp_range(const struct rb_node *node, const void *data)
 {
-	struct cache_extent *entry;
-	struct cache_extent_search_range *range;
+	const struct cache_extent *entry;
+	const struct cache_extent_search_range *range;
 
-	range = (struct cache_extent_search_range *)data;
+	range = (const struct cache_extent_search_range *)data;
 	entry = rb_entry(node, struct cache_extent, rb_node);
 
 	if (entry->start + entry->size <= range->start)
@@ -43,9 +45,9 @@ static int cache_tree_comp_range(struct rb_node *node, void *data)
 		return 0;
 }
 
-static int cache_tree_comp_nodes(struct rb_node *node1, struct rb_node *node2)
+static int cache_tree_comp_nodes(const struct rb_node *node1, const struct rb_node *node2)
 {
-	struct cache_extent *entry;
+	const struct cache_extent *entry;
 	struct cache_extent_search_range range;
 
 	entry = rb_entry(node2, struct cache_extent, rb_node);
@@ -55,10 +57,10 @@ static int cache_tree_comp_nodes(struct rb_node *node1, struct rb_node *node2)
 	return cache_tree_comp_range(node1, (void *)&range);
 }
 
-static int cache_tree_comp_range2(struct rb_node *node, void *data)
+static int cache_tree_comp_range2(const struct rb_node *node, const void *data)
 {
-	struct cache_extent *entry;
-	struct cache_extent_search_range *range;
+	const struct cache_extent *entry;
+	const struct cache_extent_search_range *range;
 
 	range = (struct cache_extent_search_range *)data;
 	entry = rb_entry(node, struct cache_extent, rb_node);
@@ -75,9 +77,9 @@ static int cache_tree_comp_range2(struct rb_node *node, void *data)
 		return 0;
 }
 
-static int cache_tree_comp_nodes2(struct rb_node *node1, struct rb_node *node2)
+static int cache_tree_comp_nodes2(const struct rb_node *node1, const struct rb_node *node2)
 {
-	struct cache_extent *entry;
+	const struct cache_extent *entry;
 	struct cache_extent_search_range range;
 
 	entry = rb_entry(node2, struct cache_extent, rb_node);
@@ -85,7 +87,7 @@ static int cache_tree_comp_nodes2(struct rb_node *node1, struct rb_node *node2)
 	range.start = entry->start;
 	range.size = entry->size;
 
-	return cache_tree_comp_range2(node1, (void *)&range);
+	return cache_tree_comp_range2(node1, &range);
 }
 
 void cache_tree_init(struct cache_tree *tree)

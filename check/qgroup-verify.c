@@ -18,21 +18,25 @@
  * Authors: Mark Fasheh <mfasheh@suse.de>
  */
 
+#include "kerncompat.h"
 #include <stdio.h>
 #include <stdlib.h>
-#include <uuid/uuid.h>
-#include "kerncompat.h"
-#include "kernel-lib/radix-tree.h"
+#include <errno.h>
+#include "kernel-lib/list.h"
+#include "kernel-lib/rbtree.h"
+#include "kernel-lib/rbtree_types.h"
+#include "kernel-shared/accessors.h"
+#include "kernel-shared/uapi/btrfs_tree.h"
 #include "kernel-shared/ctree.h"
 #include "kernel-shared/disk-io.h"
-#include "kernel-shared/print-tree.h"
-#include "common/utils.h"
 #include "kernel-shared/ulist.h"
-#include "common/rbtree-utils.h"
+#include "kernel-shared/extent_io.h"
 #include "kernel-shared/transaction.h"
-#include "repair.h"
-
-#include "qgroup-verify.h"
+#include "kernel-shared/tree-checker.h"
+#include "common/messages.h"
+#include "common/rbtree-utils.h"
+#include "check/repair.h"
+#include "check/qgroup-verify.h"
 
 static u64 *qgroup_item_count;
 
@@ -44,7 +48,6 @@ void qgroup_set_item_count_ptr(u64 *item_count_ptr)
 /*#define QGROUP_VERIFY_DEBUG*/
 static unsigned long tot_extents_scanned = 0;
 
-struct qgroup_count;
 static struct qgroup_count *find_count(u64 qgroupid);
 
 struct qgroup_info {
@@ -84,6 +87,8 @@ static struct counts_tree {
 	unsigned int		num_groups;
 	unsigned int		rescan_running:1;
 	unsigned int		qgroup_inconsist:1;
+	unsigned int		simple:1;
+	u64			enable_gen;
 	u64			scan_progress;
 } counts = { .root = RB_ROOT };
 
@@ -339,15 +344,13 @@ static int find_parent_roots(struct ulist *roots, u64 parent)
 	 */
 	ref = find_ref_bytenr(parent);
 	if (!ref) {
-		error("bytenr ref not found for parent %llu",
-				(unsigned long long)parent);
+		error("bytenr ref not found for parent %llu", parent);
 		return -EIO;
 	}
 	node = &ref->bytenr_node;
 	if (ref->bytenr != parent) {
 		error("found bytenr ref does not match parent: %llu != %llu",
-				(unsigned long long)ref->bytenr,
-				(unsigned long long)parent);
+				ref->bytenr, parent);
 		return -EIO;
 	}
 
@@ -362,9 +365,8 @@ static int find_parent_roots(struct ulist *roots, u64 parent)
 		if (prev_node) {
 			prev = rb_entry(prev_node, struct ref, bytenr_node);
 			if (prev->bytenr == parent) {
-				error(
-				"unexpected: prev bytenr same as parent: %llu",
-						(unsigned long long)parent);
+				error("unexpected: prev bytenr same as parent: %llu",
+						parent);
 				return -EIO;
 			}
 		}
@@ -403,7 +405,7 @@ static int account_one_extent(struct ulist *roots, u64 bytenr, u64 num_bytes)
 	int ret;
 	u64 id, nr_roots, nr_refs;
 	struct qgroup_count *count;
-	struct ulist *counts = ulist_alloc(0);
+	struct ulist *local_counts = ulist_alloc(0);
 	struct ulist *tmp = ulist_alloc(0);
 	struct ulist_iterator uiter;
 	struct ulist_iterator tmp_uiter;
@@ -411,8 +413,8 @@ static int account_one_extent(struct ulist *roots, u64 bytenr, u64 num_bytes)
 	struct ulist_node *tmp_unode;
 	struct btrfs_qgroup_list *glist;
 
-	if (!counts || !tmp) {
-		ulist_free(counts);
+	if (!local_counts || !tmp) {
+		ulist_free(local_counts);
 		ulist_free(tmp);
 		return ENOMEM;
 	}
@@ -430,7 +432,7 @@ static int account_one_extent(struct ulist *roots, u64 bytenr, u64 num_bytes)
 			continue;
 
 		BUG_ON(!is_fstree(unode->val));
-		ret = ulist_add(counts, count->qgroupid, ptr_to_u64(count), 0);
+		ret = ulist_add(local_counts, count->qgroupid, ptr_to_u64(count), 0);
 		if (ret < 0)
 			goto out;
 
@@ -457,7 +459,7 @@ static int account_one_extent(struct ulist *roots, u64 bytenr, u64 num_bytes)
 
 				BUG_ON(!count);
 
-				ret = ulist_add(counts, id, ptr_to_u64(parent),
+				ret = ulist_add(local_counts, id, ptr_to_u64(parent),
 						0);
 				if (ret < 0)
 					goto out;
@@ -475,7 +477,7 @@ static int account_one_extent(struct ulist *roots, u64 bytenr, u64 num_bytes)
 	 */
 	nr_roots = roots->nnodes;
 	ULIST_ITER_INIT(&uiter);
-	while ((unode = ulist_next(counts, &uiter))) {
+	while ((unode = ulist_next(local_counts, &uiter))) {
 		count = u64_to_ptr(unode->aux);
 
 		nr_refs = group_get_cur_refcnt(count);
@@ -492,7 +494,7 @@ static int account_one_extent(struct ulist *roots, u64 bytenr, u64 num_bytes)
 		printf("account (%llu, %llu), qgroup %llu/%llu, rfer %llu,"
 		       " excl %llu, refs %llu, roots %llu\n", bytenr, num_bytes,
 		       btrfs_qgroup_level(count->qgroupid),
-		       btrfs_qgroup_subvid(count->qgroupid),
+		       btrfs_qgroup_subvolid(count->qgroupid),
 		       count->info.referenced, count->info.exclusive, nr_refs,
 		       nr_roots);
 #endif
@@ -501,7 +503,7 @@ static int account_one_extent(struct ulist *roots, u64 bytenr, u64 num_bytes)
 	inc_qgroup_seq(roots->nnodes);
 	ret = 0;
 out:
-	ulist_free(counts);
+	ulist_free(local_counts);
 	ulist_free(tmp);
 	return ret;
 }
@@ -579,7 +581,7 @@ static int account_all_refs(int do_qgroups, u64 search_subvol)
 	ulist_free(roots);
 	return 0;
 enomem:
-	error("Out of memory while accounting refs for qgroups");
+	error_msg(ERROR_MSG_MEMORY, "accounting for refs for qgroups");
 	return -ENOMEM;
 }
 
@@ -640,8 +642,7 @@ static void print_tree_block(u64 bytenr, struct tree_block *block)
 	struct ref *ref;
 	struct rb_node *node;
 
-	printf("tree block: %llu\t\tlevel: %d\n", (unsigned long long)bytenr,
-	       block->level);
+	printf("tree block: %llu\t\tlevel: %d\n", bytenr, block->level);
 
 	ref = find_ref_bytenr(bytenr);
 	node = &ref->bytenr_node;
@@ -713,13 +714,16 @@ static int travel_tree(struct btrfs_fs_info *info, struct btrfs_root *root,
 {
 	int ret, nr, i;
 	struct extent_buffer *eb;
+	struct btrfs_tree_parent_check check = {
+		.owner_root = btrfs_root_id(root),
+	};
 	u64 new_bytenr;
 	u64 new_num_bytes;
 
 //	printf("travel_tree: bytenr: %llu\tnum_bytes: %llu\tref_parent: %llu\n",
 //	       bytenr, num_bytes, ref_parent);
 
-	eb = read_tree_block(info, bytenr, 0);
+	eb = read_tree_block(info, bytenr, &check);
 	if (!extent_buffer_uptodate(eb))
 		return -EIO;
 
@@ -764,6 +768,10 @@ static int add_refs_for_implied(struct btrfs_fs_info *info, u64 bytenr,
 	u64 root_id = resolve_one_root(bytenr);
 	struct btrfs_root *root;
 	struct btrfs_key key;
+
+	/* If this is a global tree skip it. */
+	if (!is_fstree(root_id))
+		return 0;
 
 	/* Tree reloc tree doesn't contribute qgroup, skip it */
 	if (root_id == BTRFS_TREE_RELOC_OBJECTID)
@@ -865,12 +873,12 @@ static struct qgroup_count *alloc_count(struct btrfs_disk_key *key,
 		c->key = *key;
 
 		item = &c->diskinfo;
-		item->referenced = btrfs_qgroup_info_referenced(leaf, disk);
+		item->referenced = btrfs_qgroup_info_rfer(leaf, disk);
 		item->referenced_compressed =
-			btrfs_qgroup_info_referenced_compressed(leaf, disk);
-		item->exclusive = btrfs_qgroup_info_exclusive(leaf, disk);
+			btrfs_qgroup_info_rfer_cmpr(leaf, disk);
+		item->exclusive = btrfs_qgroup_info_excl(leaf, disk);
 		item->exclusive_compressed =
-			btrfs_qgroup_info_exclusive_compressed(leaf, disk);
+			btrfs_qgroup_info_excl_cmpr(leaf, disk);
 		INIT_LIST_HEAD(&c->groups);
 		INIT_LIST_HEAD(&c->members);
 		INIT_LIST_HEAD(&c->bad_list);
@@ -909,22 +917,24 @@ static int add_qgroup_relation(u64 memberid, u64 parentid)
 	return 0;
 }
 
-static void read_qgroup_status(struct extent_buffer *eb, int slot,
-			      struct counts_tree *counts)
+static void read_qgroup_status(struct btrfs_fs_info *info, struct extent_buffer *eb,
+			       int slot, struct counts_tree *ct)
 {
 	struct btrfs_qgroup_status_item *status_item;
 	u64 flags;
 
 	status_item = btrfs_item_ptr(eb, slot, struct btrfs_qgroup_status_item);
 	flags = btrfs_qgroup_status_flags(eb, status_item);
+
+	if (ct->simple == 1)
+		ct->enable_gen = btrfs_qgroup_status_enable_gen(eb, status_item);
 	/*
 	 * Since qgroup_inconsist/rescan_running is just one bit,
 	 * assign value directly won't work.
 	 */
-	counts->qgroup_inconsist = !!(flags &
-			BTRFS_QGROUP_STATUS_FLAG_INCONSISTENT);
-	counts->rescan_running = !!(flags & BTRFS_QGROUP_STATUS_FLAG_RESCAN);
-	counts->scan_progress = btrfs_qgroup_status_rescan(eb, status_item);
+	ct->qgroup_inconsist = !!(flags & BTRFS_QGROUP_STATUS_FLAG_INCONSISTENT);
+	ct->rescan_running = !!(flags & BTRFS_QGROUP_STATUS_FLAG_RESCAN);
+	ct->scan_progress = btrfs_qgroup_status_rescan(eb, status_item);
 }
 
 static int load_quota_info(struct btrfs_fs_info *info)
@@ -932,7 +942,7 @@ static int load_quota_info(struct btrfs_fs_info *info)
 	int ret;
 	struct btrfs_root *root = info->quota_root;
 	struct btrfs_root *tmproot;
-	struct btrfs_path path;
+	struct btrfs_path path = { 0 };
 	struct btrfs_key key;
 	struct btrfs_key root_key;
 	struct btrfs_disk_key disk_key;
@@ -942,21 +952,21 @@ static int load_quota_info(struct btrfs_fs_info *info)
 	int i, nr;
 	int search_relations = 0;
 
+	if (btrfs_fs_incompat(info, SIMPLE_QUOTA))
+		counts.simple = 1;
 loop:
 	/*
 	 * Do 2 passes, the first allocates group counts and reads status
 	 * items. The 2nd pass picks up relation items and glues them to their
 	 * respective count structures.
 	 */
-	btrfs_init_path(&path);
-
-	key.offset = 0;
 	key.objectid = search_relations ? 0 : BTRFS_QGROUP_RELATION_KEY;
 	key.type = 0;
+	key.offset = 0;
 
 	ret = btrfs_search_slot(NULL, root, &key, &path, 0, 0);
 	if (ret < 0) {
-		fprintf(stderr, "ERROR: Couldn't search slot: %d\n", ret);
+		error("couldn't search slot: %d", ret);
 		goto out;
 	}
 
@@ -973,7 +983,10 @@ loop:
 					ret = add_qgroup_relation(key.objectid,
 								  key.offset);
 					if (ret) {
-						error("out of memory");
+						errno = -ret;
+						error(
+		"failed to add qgroup relation, member=%llu parent=%llu: %m",
+						      key.objectid, key.offset);
 						goto out;
 					}
 				}
@@ -981,7 +994,7 @@ loop:
 			}
 
 			if (key.type == BTRFS_QGROUP_STATUS_KEY) {
-				read_qgroup_status(leaf, i, &counts);
+				read_qgroup_status(info, leaf, i, &counts);
 				continue;
 			}
 
@@ -998,7 +1011,7 @@ loop:
 			count = alloc_count(&disk_key, leaf, item);
 			if (!count) {
 				ret = ENOMEM;
-				fprintf(stderr, "ERROR: out of memory\n");
+				error_msg(ERROR_MSG_MEMORY, NULL);
 				goto out;
 			}
 
@@ -1029,6 +1042,54 @@ out:
 	return ret;
 }
 
+static int simple_quota_account_extent(struct btrfs_fs_info *info,
+				       struct extent_buffer *leaf,
+				       struct btrfs_key *key,
+				       struct btrfs_extent_item *ei,
+				       struct btrfs_extent_inline_ref *iref,
+				       u64 bytenr, u64 num_bytes, int meta_item)
+{
+	u64 generation;
+	int type;
+	u64 root;
+	struct ulist *roots = ulist_alloc(0);
+	int ret;
+	struct extent_buffer *node_eb;
+
+	generation = btrfs_extent_generation(leaf, ei);
+	if (generation < counts.enable_gen)
+		return 0;
+
+	type = btrfs_extent_inline_ref_type(leaf, iref);
+	if (!meta_item) {
+		if (type == BTRFS_EXTENT_OWNER_REF_KEY) {
+			struct btrfs_extent_owner_ref *oref;
+
+			oref = (struct btrfs_extent_owner_ref *)(&iref->offset);
+			root = btrfs_extent_owner_ref_root_id(leaf, oref);
+		} else {
+			return 0;
+		}
+	} else {
+		struct btrfs_tree_parent_check check = { 0 };
+
+		check.owner_root = btrfs_root_id(btrfs_extent_root(info, key->objectid));
+		node_eb = read_tree_block(info, key->objectid, &check);
+		if (!extent_buffer_uptodate(node_eb))
+			return -EIO;
+		root = btrfs_header_owner(node_eb);
+		free_extent_buffer(node_eb);
+	}
+
+	if (!is_fstree(root))
+		return 0;
+
+	ulist_add(roots, root, 0, 0);
+	ret = account_one_extent(roots, bytenr, num_bytes);
+	ulist_free(roots);
+	return ret;
+}
+
 static int add_inline_refs(struct btrfs_fs_info *info,
 			   struct extent_buffer *ei_leaf, int slot,
 			   u64 bytenr, u64 num_bytes, int meta_item)
@@ -1036,13 +1097,15 @@ static int add_inline_refs(struct btrfs_fs_info *info,
 	struct btrfs_extent_item *ei;
 	struct btrfs_extent_inline_ref *iref;
 	struct btrfs_extent_data_ref *dref;
+	struct btrfs_key key;
 	u64 flags, root_obj, offset, parent;
-	u32 item_size = btrfs_item_size_nr(ei_leaf, slot);
+	u32 item_size = btrfs_item_size(ei_leaf, slot);
 	int type;
 	unsigned long end;
 	unsigned long ptr;
 
 	ei = btrfs_item_ptr(ei_leaf, slot, struct btrfs_extent_item);
+	btrfs_item_key_to_cpu(ei_leaf, &key, slot);
 	flags = btrfs_extent_flags(ei_leaf, ei);
 
 	if (flags & BTRFS_EXTENT_FLAG_TREE_BLOCK && !meta_item) {
@@ -1051,6 +1114,15 @@ static int add_inline_refs(struct btrfs_fs_info *info,
 		iref = (struct btrfs_extent_inline_ref *)(tbinfo + 1);
 	} else {
 		iref = (struct btrfs_extent_inline_ref *)(ei + 1);
+	}
+
+	if (counts.simple) {
+		int ret = simple_quota_account_extent(info, ei_leaf, &key, ei, iref,
+						      bytenr, num_bytes, meta_item);
+
+		if (ret)
+			error("squota account extent error: %d", ret);
+		return ret;
 	}
 
 	ptr = (unsigned long)iref;
@@ -1074,6 +1146,7 @@ static int add_inline_refs(struct btrfs_fs_info *info,
 			parent = offset;
 			break;
 		default:
+			error("unexpected iref type %d", type);
 			return 1;
 		}
 
@@ -1153,14 +1226,12 @@ static int scan_extents(struct btrfs_fs_info *info,
 			u64 start, u64 end)
 {
 	int ret, i, nr, level;
-	struct btrfs_root *root = info->extent_root;
+	struct btrfs_root *root = btrfs_extent_root(info, start);
 	struct btrfs_key key;
-	struct btrfs_path path;
+	struct btrfs_path path = { 0 };
 	struct btrfs_disk_key disk_key;
 	struct extent_buffer *leaf;
 	u64 bytenr = 0, num_bytes = 0;
-
-	btrfs_init_path(&path);
 
 	key.objectid = start;
 	key.type = 0;
@@ -1168,7 +1239,7 @@ static int scan_extents(struct btrfs_fs_info *info,
 
 	ret = btrfs_search_slot(NULL, root, &key, &path, 0, 0);
 	if (ret < 0) {
-		fprintf(stderr, "ERROR: Couldn't search slot: %d\n", ret);
+		error("couldn't search slot: %d", ret);
 		goto out;
 	}
 	path.reada = READA_BACK;
@@ -1238,8 +1309,7 @@ static int scan_extents(struct btrfs_fs_info *info,
 		ret = btrfs_next_leaf(root, &path);
 		if (ret != 0) {
 			if (ret < 0) {
-				fprintf(stderr,
-					"ERROR: Next leaf failed: %d\n", ret);
+				error("next leaf failed: %d", ret);
 				goto out;
 			}
 			break;
@@ -1257,8 +1327,7 @@ static void print_fields(u64 bytes, u64 bytes_compressed, char *prefix,
 			 char *type)
 {
 	printf("%s\t\t%s %llu %s compressed %llu\n",
-	       prefix, type, (unsigned long long)bytes, type,
-	       (unsigned long long)bytes_compressed);
+	       prefix, type, bytes, type, bytes_compressed);
 }
 
 static void print_fields_signed(long long bytes,
@@ -1285,9 +1354,9 @@ static int report_qgroup_difference(struct qgroup_count *count, int verbose)
 	is_different = excl_diff || ref_diff;
 
 	if (verbose || (is_different && qgroup_printable(count))) {
-		printf("Counts for qgroup id: %llu/%llu %s\n",
+		printf("Counts for qgroup id: %u/%llu %s\n",
 		       btrfs_qgroup_level(count->qgroupid),
-		       btrfs_qgroup_subvid(count->qgroupid),
+		       btrfs_qgroup_subvolid(count->qgroupid),
 		       is_different ? "are different" : "");
 
 		print_fields(info->referenced, info->referenced_compressed,
@@ -1319,7 +1388,7 @@ void report_qgroups(int all)
 	struct rb_node *node;
 	struct qgroup_count *c;
 
-	if (!repair && counts.rescan_running) {
+	if (!opt_check_repair && counts.rescan_running) {
 		if (all) {
 			printf(
 	"Qgroup rescan is running, a difference in qgroup counts is expected\n");
@@ -1396,6 +1465,7 @@ static bool is_bad_qgroup(struct qgroup_count *count)
  */
 int qgroup_verify_all(struct btrfs_fs_info *info)
 {
+	struct rb_node *n;
 	int ret;
 	bool found_err = false;
 	bool skip_err = false;
@@ -1406,14 +1476,13 @@ int qgroup_verify_all(struct btrfs_fs_info *info)
 
 	tree_blocks = ulist_alloc(0);
 	if (!tree_blocks) {
-		fprintf(stderr,
-			"ERROR: Out of memory while allocating ulist.\n");
+		error_msg(ERROR_MSG_MEMORY, "allocate ulist");
 		return ENOMEM;
 	}
 
 	ret = load_quota_info(info);
 	if (ret) {
-		fprintf(stderr, "ERROR: Loading qgroups from disk: %d\n", ret);
+		error("loading qgroups from disk: %d", ret);
 		goto out;
 	}
 
@@ -1426,20 +1495,34 @@ int qgroup_verify_all(struct btrfs_fs_info *info)
 	/*
 	 * Put all extent refs into our rbtree
 	 */
-	ret = scan_extents(info, 0, ~0ULL);
-	if (ret) {
-		fprintf(stderr, "ERROR: while scanning extent tree: %d\n", ret);
-		goto out;
+	for (n = rb_first(&info->block_group_cache_tree); n; n = rb_next(n)) {
+		struct btrfs_block_group *bg;
+
+		bg = rb_entry(n, struct btrfs_block_group, cache_node);
+		ret = scan_extents(info, bg->start,
+				   bg->start + bg->length - 1);
+		if (ret) {
+			error("while scanning extent tree: %d", ret);
+			goto out;
+		}
 	}
+	/*
+	 * As in the kernel, simple qgroup accounting is done locally per extent,
+	 * so we don't need to resolve backrefs to find which subvol an extent
+	 * is accounted to.
+	 */
+	if (counts.simple)
+		goto check;
 
 	ret = map_implied_refs(info);
 	if (ret) {
-		fprintf(stderr, "ERROR: while mapping refs: %d\n", ret);
+		error("while mapping refs: %d", ret);
 		goto out;
 	}
 
 	ret = account_all_refs(1, 0);
 
+check:
 	/*
 	 * Do the correctness check here, so for callers who don't want
 	 * verbose report can skip calling report_qgroups()
@@ -1503,27 +1586,33 @@ static void print_subvol_info(u64 subvolid, u64 bytenr, u64 num_bytes,
 
 int print_extent_state(struct btrfs_fs_info *info, u64 subvol)
 {
+	struct rb_node *n;
 	int ret;
 
 	tree_blocks = ulist_alloc(0);
 	if (!tree_blocks) {
-		fprintf(stderr,
-			"ERROR: Out of memory while allocating ulist.\n");
+		error_msg(ERROR_MSG_MEMORY, "allocate ulist");
 		return ENOMEM;
 	}
 
 	/*
 	 * Put all extent refs into our rbtree
 	 */
-	ret = scan_extents(info, 0, ~0ULL);
-	if (ret) {
-		fprintf(stderr, "ERROR: while scanning extent tree: %d\n", ret);
-		goto out;
+	for (n = rb_first(&info->block_group_cache_tree); n; n = rb_next(n)) {
+		struct btrfs_block_group *bg;
+
+		bg = rb_entry(n, struct btrfs_block_group, cache_node);
+		ret = scan_extents(info, bg->start,
+				   bg->start + bg->length - 1);
+		if (ret) {
+			error("while scanning extent tree: %d", ret);
+			goto out;
+		}
 	}
 
 	ret = map_implied_refs(info);
 	if (ret) {
-		fprintf(stderr, "ERROR: while mapping refs: %d\n", ret);
+		error("while mapping refs: %d", ret);
 		goto out;
 	}
 
@@ -1542,28 +1631,27 @@ static int repair_qgroup_info(struct btrfs_fs_info *info,
 	int ret;
 	struct btrfs_root *root = info->quota_root;
 	struct btrfs_trans_handle *trans;
-	struct btrfs_path path;
+	struct btrfs_path path = { 0 };
 	struct btrfs_qgroup_info_item *info_item;
 	struct btrfs_key key;
 
 	if (!silent)
-		printf("Repair qgroup %llu/%llu\n",
+		printf("Repair qgroup %u/%llu\n",
 			btrfs_qgroup_level(count->qgroupid),
-			btrfs_qgroup_subvid(count->qgroupid));
+			btrfs_qgroup_subvolid(count->qgroupid));
 
 	trans = btrfs_start_transaction(root, 1);
 	if (IS_ERR(trans))
 		return PTR_ERR(trans);
 
-	btrfs_init_path(&path);
 	key.objectid = 0;
 	key.type = BTRFS_QGROUP_INFO_KEY;
 	key.offset = count->qgroupid;
 	ret = btrfs_search_slot(trans, root, &key, &path, 0, 1);
 	if (ret) {
-		error("could not find disk item for qgroup %llu/%llu",
+		error("could not find disk item for qgroup %u/%llu",
 		      btrfs_qgroup_level(count->qgroupid),
-		      btrfs_qgroup_subvid(count->qgroupid));
+		      btrfs_qgroup_subvolid(count->qgroupid));
 		if (ret > 0)
 			ret = -ENOENT;
 		goto out;
@@ -1575,14 +1663,14 @@ static int repair_qgroup_info(struct btrfs_fs_info *info,
 	btrfs_set_qgroup_info_generation(path.nodes[0], info_item,
 					 trans->transid);
 
-	btrfs_set_qgroup_info_referenced(path.nodes[0], info_item,
+	btrfs_set_qgroup_info_rfer(path.nodes[0], info_item,
 					 count->info.referenced);
-	btrfs_set_qgroup_info_referenced_compressed(path.nodes[0], info_item,
+	btrfs_set_qgroup_info_rfer_cmpr(path.nodes[0], info_item,
 					    count->info.referenced_compressed);
 
-	btrfs_set_qgroup_info_exclusive(path.nodes[0], info_item,
+	btrfs_set_qgroup_info_excl(path.nodes[0], info_item,
 					count->info.exclusive);
-	btrfs_set_qgroup_info_exclusive_compressed(path.nodes[0], info_item,
+	btrfs_set_qgroup_info_excl_cmpr(path.nodes[0], info_item,
 					   count->info.exclusive_compressed);
 
 	btrfs_mark_buffer_dirty(path.nodes[0]);
@@ -1599,9 +1687,11 @@ static int repair_qgroup_status(struct btrfs_fs_info *info, bool silent)
 	int ret;
 	struct btrfs_root *root = info->quota_root;
 	struct btrfs_trans_handle *trans;
-	struct btrfs_path path;
+	struct btrfs_path path = { 0 };
 	struct btrfs_key key;
 	struct btrfs_qgroup_status_item *status_item;
+	bool simple = btrfs_fs_incompat(info, SIMPLE_QUOTA);
+	u64 flags = BTRFS_QGROUP_STATUS_FLAG_ON;
 
 	if (!silent)
 		printf("Repair qgroup status item\n");
@@ -1610,7 +1700,6 @@ static int repair_qgroup_status(struct btrfs_fs_info *info, bool silent)
 	if (IS_ERR(trans))
 		return PTR_ERR(trans);
 
-	btrfs_init_path(&path);
 	key.objectid = 0;
 	key.type = BTRFS_QGROUP_STATUS_KEY;
 	key.offset = 0;
@@ -1624,8 +1713,9 @@ static int repair_qgroup_status(struct btrfs_fs_info *info, bool silent)
 
 	status_item = btrfs_item_ptr(path.nodes[0], path.slots[0],
 				     struct btrfs_qgroup_status_item);
-	btrfs_set_qgroup_status_flags(path.nodes[0], status_item,
-				      BTRFS_QGROUP_STATUS_FLAG_ON);
+	if (simple)
+		flags |= BTRFS_QGROUP_STATUS_FLAG_SIMPLE_MODE;
+	btrfs_set_qgroup_status_flags(path.nodes[0], status_item, flags);
 	btrfs_set_qgroup_status_rescan(path.nodes[0], status_item, 0);
 	btrfs_set_qgroup_status_generation(path.nodes[0], status_item,
 					   trans->transid);

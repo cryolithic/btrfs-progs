@@ -18,7 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "ioctl.h"
+#include "kernel-shared/uapi/btrfs.h"
 #include "kernel-shared/ctree.h"
 
 #define LIST_32_COMPAT				\
@@ -32,8 +32,6 @@
 	ONE(BTRFS_IOC_DEFRAG)			\
 	ONE(BTRFS_IOC_RESIZE)			\
 	ONE(BTRFS_IOC_SCAN_DEV)			\
-	ONE(BTRFS_IOC_TRANS_START)		\
-	ONE(BTRFS_IOC_TRANS_END)		\
 	ONE(BTRFS_IOC_SYNC)			\
 	ONE(BTRFS_IOC_CLONE)			\
 	ONE(BTRFS_IOC_ADD_DEV)			\
@@ -100,8 +98,6 @@ static struct ioctl_number expected_list[] = {
 	{ BTRFS_IOC_DEFRAG,                         0x0050009402 },
 	{ BTRFS_IOC_RESIZE,                         0x0050009403 },
 	{ BTRFS_IOC_SCAN_DEV,                       0x0050009404 },
-	{ BTRFS_IOC_TRANS_START,                    0x0000009406 },
-	{ BTRFS_IOC_TRANS_END,                      0x0000009407 },
 	{ BTRFS_IOC_SYNC,                           0x0000009408 },
 	{ BTRFS_IOC_CLONE,                          0x0040049409 },
 	{ BTRFS_IOC_ADD_DEV,                        0x005000940a },
@@ -196,7 +192,7 @@ static struct btrfs_ioctl_dev_replace_args used_replace_args __attribute__((used
 static struct btrfs_ioctl_same_args used_same_args __attribute__((used));
 static struct btrfs_ioctl_feature_flags used_feature_flags __attribute__((used));
 
-const char* value_to_string(unsigned long num)
+static const char* value_to_string(unsigned long num)
 {
 #define ONE(x)	case x: return #x;
 	switch (num) {

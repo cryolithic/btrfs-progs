@@ -23,10 +23,11 @@
 #define __BTRFS_CONVERT_COMMON_H__
 
 #include "kerncompat.h"
-#include "common/defs.h"
 #include "common/extent-cache.h"
 
 struct btrfs_mkfs_config;
+
+#define SOURCE_FS_UUID_SIZE	(16)
 
 struct btrfs_convert_context {
 	u32 blocksize;
@@ -36,7 +37,8 @@ struct btrfs_convert_context {
 	u64 free_inodes_count;
 	u64 total_bytes;
 	u64 free_bytes_initial;
-	char *volume_name;
+	char *label;
+	u8 fs_uuid[SOURCE_FS_UUID_SIZE];
 	const struct btrfs_convert_operations *convert_ops;
 
 	/* The accurate used space of old filesystem */
@@ -60,5 +62,26 @@ struct btrfs_convert_context {
 
 int make_convert_btrfs(int fd, struct btrfs_mkfs_config *cfg,
 			      struct btrfs_convert_context *cctx);
+
+/*
+ * Represents a simple contiguous range.
+ *
+ * For multiple or non-contiguous ranges, use extent_cache_tree from
+ * extent-cache.c
+ */
+struct simple_range {
+	u64 start;
+	u64 len;
+};
+
+/*
+ * Simple range functions
+ */
+
+/* Get range end (exclusive) */
+static inline u64 range_end(const struct simple_range *range)
+{
+	return (range->start + range->len);
+}
 
 #endif

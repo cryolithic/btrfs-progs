@@ -5,14 +5,48 @@ functionality is in user space and does not need a virtual machine. The
 features supported by the running kernel are detected and tests skipped
 eventually.
 
+## Quick start
+
+- install docker, add `"storage-driver": "btrfs"` to */etc/docker/daemon.json*,
+  make sure your user is in group *docker*, start the service
+- pull all images by `ci/images/images-base-update`, this can take time
+- build all images for testing by `ci/images/images-build-all`, or individually
+  in the *ci/images/ci-\** directories
+- build current branch and test it in the docker image by running `ci/ci-build-musl` from
+  the top directory (this will create a fresh tar archive inside the docker sources
+  and the image must be rebuilt)
+- `ci/ci-build-*` scripts to build on the target image
+
 ## Hosted
 
-**Travis CI**
+Currently the CI is hosted on Github actions, running build and functional tests.
 
-The Travis service is set up to run tests on development and release branches,
-triggered by a push to the repository. Pull requests are not set up to run.
+Status: https://github.com/kdave/btrfs-progs/actions
 
-[Branch overview](https://travis-ci.org/kdave/btrfs-progs)
+Tested branches:
+
+- devel - regularly pushed during development, basic build and functionality test
+- release-test - pushed before a release to verify more build targets (for backward
+  compatibility)
+- devel-ci - for testing and development of the CI itself
+
+References:
+
+- Documentation: https://docs.github.com/en/actions
+- Details about image package versions, updates: https://github.com/actions/runner-images
+
+### Requirements for hosted infrastructure
+
+In case migration to another hosted CI is needed:
+
+* recent kernel, latest stable if possible, 5.15 is minimum
+* ability to run commands as root
+* ability to create loop devices (losetup)
+* ability to mount and unmount filesystems
+* integration with github/gitlab repository to watch for updates
+* enough granted run time to finish the testsuite
+* (optional) run docker images
+* (nice to have) web GUI with results, email notifications
 
 **Gitlab**
 
@@ -125,10 +159,21 @@ image template or enhancing current support scripts.
 To do:
 
 - 32bit coverage -- while this architecture is fading out, it may be useful to
-  still have some coverage, however running 32bit docker in 64bit is not
-  considered experimental does not work out of the box
-- static build -- when all build dependencies provide the static library
-  versions, it's possible to to build the static binaries of all the tools
+  still have some coverage, however running 32bit docker in 64bit is
+  considered experimental and does not work out of the box
 - add some kind of templates, there's a lot of repeated stuff in the
   *Dockerfile*s and the scripts need to be inside the directories in order to
   allow copying them to the image
+
+## Administration
+
+To pull all base images from docker hub or to update already downloaded ones run
+
+    ci/images/images-base-update
+
+Before running the CI tests locally the images need to be build from the templates,
+for that there's
+
+    ci/images/images-build-all
+
+Which is similar to running the `docker-build` command inside the directories.

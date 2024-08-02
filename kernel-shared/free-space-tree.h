@@ -19,9 +19,23 @@
 #ifndef __BTRFS_FREE_SPACE_TREE_H__
 #define __BTRFS_FREE_SPACE_TREE_H__
 
+#include "kerncompat.h"
+#include "kernel-lib/bitops.h"
+
+struct btrfs_block_group;
+struct btrfs_fs_info;
+struct btrfs_trans_handle;
+
+/*
+ * The default size for new free space bitmap items. The last bitmap in a block
+ * group may be truncated, and none of the free space tree code assumes that
+ * existing bitmaps are this size.
+ */
 #define BTRFS_FREE_SPACE_BITMAP_SIZE 256
 #define BTRFS_FREE_SPACE_BITMAP_BITS (BTRFS_FREE_SPACE_BITMAP_SIZE * BITS_PER_BYTE)
 
+void set_free_space_tree_thresholds(struct btrfs_fs_info *fs_info,
+				    struct btrfs_block_group *cache);
 int btrfs_clear_free_space_tree(struct btrfs_fs_info *fs_info);
 int load_free_space_tree(struct btrfs_fs_info *fs_info,
 			 struct btrfs_block_group *block_group);
@@ -34,5 +48,7 @@ int add_to_free_space_tree(struct btrfs_trans_handle *trans, u64 start,
 int remove_from_free_space_tree(struct btrfs_trans_handle *trans, u64 start,
 				u64 size);
 int btrfs_create_free_space_tree(struct btrfs_fs_info *info);
+int add_block_group_free_space(struct btrfs_trans_handle *trans,
+			       struct btrfs_block_group *block_group);
 
 #endif

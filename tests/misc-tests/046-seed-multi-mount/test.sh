@@ -1,7 +1,7 @@
 #!/bin/bash
 # Verify that a seeding device can be mounted several times
 
-source "$TEST_TOP/common"
+source "$TEST_TOP/common" || exit
 
 check_prereq btrfs-image
 check_prereq mkfs.btrfs
@@ -22,9 +22,9 @@ run_check_mkfs_test_dev -L BTRFS-TESTS-SEED
 run_check_mount_test_dev
 
 for i in `seq 6`; do
-	run_check $SUDO_HELPER dd if=/dev/zero of="$TEST_MNT/file${i}" bs=1M count=1 status=none
+	run_check $SUDO_HELPER dd if=/dev/zero of="$TEST_MNT/file$i" bs=1M count=1 status=none
 	# Something to distinguish the contents
-	run_check md5sum "$TEST_MNT/file${i}"
+	run_check md5sum "$TEST_MNT/file$i"
 done
 run_check_umount_test_dev
 
@@ -34,6 +34,9 @@ TEST_DEV=${loopdevs[1]}
 
 nextdevice() {
 	local nextdev
+	local mnt
+	local md5sum
+	local md5sum2
 
 	nextdev="$1"
 	# Mount again, as seeding device
@@ -42,9 +45,12 @@ nextdevice() {
 	run_check mkdir -p "$mnt"
 	TEST_MNT="$mnt"
 	run_check_mount_test_dev
-	run_check $SUDO_HELPER "$TOP/btrfs" device add ${loopdevs[$nextdev]} "$TEST_MNT"
 	run_mustfail "writable file despite read-only mount" \
 		$SUDO_HELPER dd if=/dev/zero of="$TEST_MNT/file$nextdevice" bs=1M count=1 status=none
+	run_check $SUDO_HELPER "$TOP/btrfs" device add ${loopdevs[$nextdev]} "$TEST_MNT"
+	# Although seed sprout would make the fs RW, explicitly remount it RW
+	# just in case of future behavior change.
+	cond_wait_for_loopdevs
 	run_check $SUDO_HELPER mount -o remount,rw "$TEST_MNT"
 	# Rewrite the file
 	md5sum=$(run_check_stdout md5sum "$TEST_MNT/file$nextdev" | awk '{print $1}')

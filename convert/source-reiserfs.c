@@ -17,15 +17,25 @@
 #if BTRFSCONVERT_REISERFS
 
 #include "kerncompat.h"
-#include <linux/limits.h>
-#include <linux/fs.h>
-#include <limits.h>
 #include <sys/stat.h>
+#include <linux/fs.h>
 #include <stdbool.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <reiserfs/reiserfs_lib.h>
+#include "kernel-lib/bitops.h"
 #include "kernel-shared/disk-io.h"
 #include "kernel-shared/transaction.h"
-#include "common/utils.h"
-#include "kernel-lib/bitops.h"
+#include "kernel-shared/extent_io.h"
+#include "kernel-shared/file-item.h"
+#include "common/extent-cache.h"
+#include "common/internal.h"
+#include "common/messages.h"
+#include "common/extent-tree-utils.h"
 #include "convert/common.h"
 #include "convert/source-reiserfs.h"
 
@@ -83,10 +93,11 @@ static int reiserfs_open_fs(struct btrfs_convert_context *cxt, const char *name)
 	cxt->blocksize = fs->fs_blocksize;
 	cxt->block_count = get_sb_block_count(fs->fs_ondisk_sb);
 	cxt->total_bytes = (u64)cxt->block_count * cxt->blocksize;
-	cxt->volume_name = strndup(fs->fs_ondisk_sb->s_label, 16);
+	cxt->label = strndup(fs->fs_ondisk_sb->s_label, 16);
 	cxt->first_data_block = 0;
 	cxt->inodes_count = reiserfs_count_objectids(fs);
 	cxt->free_inodes_count = 0;
+	memcpy(cxt->fs_uuid, fs->fs_ondisk_sb->s_uuid, SOURCE_FS_UUID_SIZE);
 	info = calloc(1, sizeof(*info));
 	if (!info) {
 		reiserfs_close(fs);
@@ -342,7 +353,6 @@ static int convert_direct(struct btrfs_trans_handle *trans,
 	struct btrfs_key key;
 	u32 sectorsize = root->fs_info->sectorsize;
 	int ret;
-	struct extent_buffer *eb;
 
 	BUG_ON(length > sectorsize);
 	ret = btrfs_reserve_extent(trans, root, sectorsize,
@@ -350,14 +360,7 @@ static int convert_direct(struct btrfs_trans_handle *trans,
 	if (ret)
 		return ret;
 
-	eb = alloc_extent_buffer(root->fs_info, key.objectid, sectorsize);
-
-	if (!eb)
-		return -ENOMEM;
-
-	write_extent_buffer(eb, body, 0, length);
-	ret = write_and_map_eb(root->fs_info, eb);
-	free_extent_buffer(eb);
+	ret = write_data_to_disk(root->fs_info, body, key.objectid, sectorsize);
 	if (ret)
 		return ret;
 
@@ -634,8 +637,9 @@ static int reiserfs_copy_meta(reiserfs_filsys_t fs, struct btrfs_root *root,
 			goto fail;
 		}
 
-		ret = btrfs_insert_inode_ref(trans, root, "..", 2, parent,
-					     objectid, 0);
+		if (parent == objectid)
+			ret = btrfs_insert_inode_ref(trans, root, "..", 2, parent,
+						     objectid, 0);
 		break;
 	case S_IFLNK:
 		trans = btrfs_start_transaction(root, 1);
@@ -678,7 +682,7 @@ static int reiserfs_xattr_indirect_fn(reiserfs_filsys_t fs, u64 position,
 
 	if (size > BTRFS_LEAF_DATA_SIZE(xa_data->root->fs_info) -
 	    sizeof(struct btrfs_item) - sizeof(struct btrfs_dir_item)) {
-		fprintf(stderr, "skip large xattr on objectid %llu name %.*s\n",
+		error("skip large xattr on objectid %llu name %.*s",
 			xa_data->target_oid, (int)xa_data->namelen,
 			xa_data->name);
 		return -E2BIG;
@@ -716,7 +720,7 @@ static int reiserfs_xattr_direct_fn(reiserfs_filsys_t fs, __u64 position,
 
 	if (size > BTRFS_LEAF_DATA_SIZE(xa_data->root->fs_info) -
 	    sizeof(struct btrfs_item) - sizeof(struct btrfs_dir_item)) {
-		fprintf(stderr, "skip large xattr on objectid %llu name %.*s\n",
+		error("skip large xattr on objectid %llu name %.*s",
 			xa_data->target_oid, (int)xa_data->namelen,
 			xa_data->name);
 		return -E2BIG;
@@ -750,7 +754,10 @@ static int reiserfs_acl_to_xattr(void *dst, const void *src,
 	if (count <= 0)
 		goto fail;
 
-	BUG_ON(dst_size < acl_ea_size(count));
+	if (dst_size < acl_ea_size(count)) {
+		error("not enough space to store ACLs");
+		goto fail;
+	}
 	ext_acl->a_version = cpu_to_le32(ACL_EA_VERSION);
 	for (i = 0; i < count; i++, dst_entry++) {
 		src_entry = (struct reiserfs_acl_entry *)src;
@@ -809,8 +816,7 @@ static int reiserfs_copy_one_xattr(reiserfs_filsys_t fs,
 		goto out;
 
 	if (!reiserfs_check_xattr(xa_data->body, xa_data->len)) {
-		fprintf(stderr,
-			"skip corrupted xattr on objectid %u name %.*s\n",
+		error("skip corrupted xattr on objectid %u name %.*s",
 			deh_objectid, (int)xa_data->namelen,
 			xa_data->name);
 		goto out;

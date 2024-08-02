@@ -19,20 +19,9 @@
 #ifndef __BTRFS_SEND_STREAM_H__
 #define __BTRFS_SEND_STREAM_H__
 
-/*
- * NOTE: this file is public API, any incompatible change has to update
- * library version
- */
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-#if BTRFS_FLAT_INCLUDES
 #include "kerncompat.h"
-#else
-#include <btrfs/kerncompat.h>
-#endif /* BTRFS_FLAT_INCLUDES */
+
+struct timespec;
 
 struct btrfs_send_ops {
 	int (*subvol)(const char *path, const u8 *uuid, u64 ctransid,
@@ -66,15 +55,21 @@ struct btrfs_send_ops {
 		      struct timespec *mt, struct timespec *ct,
 		      void *user);
 	int (*update_extent)(const char *path, u64 offset, u64 len, void *user);
+	int (*encoded_write)(const char *path, const void *data, u64 offset,
+			     u64 len, u64 unencoded_file_len, u64 unencoded_len,
+			     u64 unencoded_offset, u32 compression,
+			     u32 encryption, void *user);
+	int (*fallocate)(const char *path, int mode, u64 offset, u64 len,
+			 void *user);
+	int (*fileattr)(const char *path, u64 attr, void *user);
+	int (*enable_verity)(const char *path, u8 algorithm, u32 block_size,
+			     int salt_len, char *salt,
+			     int sig_len, char *sig, void *user);
 };
 
 int btrfs_read_and_process_send_stream(int fd,
 				       struct btrfs_send_ops *ops, void *user,
 				       int honor_end_cmd,
 				       u64 max_errors);
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif

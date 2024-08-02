@@ -11,30 +11,37 @@
  * General Public License for more details.
  *
  * You should have received a copy of the GNU General Public
- * License along with this program.
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
  */
 
 #include "kerncompat.h"
-#include "androidcompat.h"
-
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <sys/xattr.h>
-#include <linux/limits.h>
 #include <dirent.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <ftw.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kernel-lib/sizes.h"
+#include "kernel-shared/accessors.h"
+#include "kernel-shared/uapi/btrfs_tree.h"
+#include "kernel-shared/extent_io.h"
 #include "kernel-shared/ctree.h"
 #include "kernel-shared/volumes.h"
-#include "common/internal.h"
 #include "kernel-shared/disk-io.h"
-#include "common/messages.h"
 #include "kernel-shared/transaction.h"
+#include "kernel-shared/file-item.h"
+#include "common/internal.h"
+#include "common/messages.h"
+#include "common/path-utils.h"
 #include "common/utils.h"
+#include "common/extent-tree-utils.h"
 #include "mkfs/rootdir.h"
-#include "mkfs/common.h"
-#include "common/send-utils.h"
 
 static u32 fs_block_size;
 
@@ -69,8 +76,8 @@ static int add_directory_items(struct btrfs_trans_handle *trans,
 	name_len = strlen(name);
 
 	location.objectid = objectid;
-	location.offset = 0;
 	location.type = BTRFS_INODE_ITEM_KEY;
+	location.offset = 0;
 
 	if (S_ISDIR(st->st_mode))
 		filetype = BTRFS_FT_DIR;
@@ -156,7 +163,7 @@ static int fill_inode_item(struct btrfs_trans_handle *trans,
 	return 0;
 }
 
-static int directory_select(const struct direct *entry)
+static int directory_select(const struct dirent *entry)
 {
 	if (entry->d_name[0] == '.' &&
 		(entry->d_name[1] == 0 ||
@@ -165,7 +172,7 @@ static int directory_select(const struct direct *entry)
 	return 1;
 }
 
-static void free_namelist(struct direct **files, int count)
+static void free_namelist(struct dirent **files, int count)
 {
 	int i;
 
@@ -180,7 +187,7 @@ static void free_namelist(struct direct **files, int count)
 static u64 calculate_dir_inode_size(const char *dirname)
 {
 	int count, i;
-	struct direct **files, *cur_file;
+	struct dirent **files, *cur_file;
 	u64 dir_inode_size = 0;
 
 	count = scandir(dirname, &files, directory_select, NULL);
@@ -301,17 +308,18 @@ static int add_file_items(struct btrfs_trans_handle *trans,
 			  struct btrfs_inode_item *btrfs_inode, u64 objectid,
 			  struct stat *st, const char *path_name)
 {
+	struct btrfs_fs_info *fs_info = trans->fs_info;
 	int ret = -1;
 	ssize_t ret_read;
 	u64 bytes_read = 0;
 	struct btrfs_key key;
 	int blocks;
-	u32 sectorsize = root->fs_info->sectorsize;
+	u32 sectorsize = fs_info->sectorsize;
 	u64 first_block = 0;
 	u64 file_pos = 0;
 	u64 cur_bytes;
 	u64 total_bytes;
-	struct extent_buffer *eb = NULL;
+	void *buf = NULL;
 	int fd;
 
 	if (st->st_size == 0)
@@ -327,7 +335,7 @@ static int add_file_items(struct btrfs_trans_handle *trans,
 	if (st->st_size % sectorsize)
 		blocks += 1;
 
-	if (st->st_size <= BTRFS_MAX_INLINE_DATA_SIZE(root->fs_info) &&
+	if (st->st_size <= BTRFS_MAX_INLINE_DATA_SIZE(fs_info) &&
 	    st->st_size < sectorsize) {
 		char *buffer = malloc(st->st_size);
 
@@ -336,11 +344,10 @@ static int add_file_items(struct btrfs_trans_handle *trans,
 			goto end;
 		}
 
-		ret_read = pread64(fd, buffer, st->st_size, bytes_read);
+		ret_read = pread(fd, buffer, st->st_size, bytes_read);
 		if (ret_read == -1) {
 			error("cannot read %s at offset %llu length %llu: %m",
-				path_name, (unsigned long long)bytes_read,
-				(unsigned long long)st->st_size);
+				path_name, bytes_read, (unsigned long long)st->st_size);
 			free(buffer);
 			goto end;
 		}
@@ -354,12 +361,8 @@ static int add_file_items(struct btrfs_trans_handle *trans,
 	/* round up our st_size to the FS blocksize */
 	total_bytes = (u64)blocks * sectorsize;
 
-	/*
-	 * do our IO in extent buffers so it can work
-	 * against any raid type
-	 */
-	eb = calloc(1, sizeof(*eb) + sectorsize);
-	if (!eb) {
+	buf = malloc(sectorsize);
+	if (!buf) {
 		ret = -ENOMEM;
 		goto end;
 	}
@@ -381,37 +384,27 @@ again:
 
 	while (bytes_read < cur_bytes) {
 
-		memset(eb->data, 0, sectorsize);
+		memset(buf, 0, sectorsize);
 
-		ret_read = pread64(fd, eb->data, sectorsize, file_pos +
-				   bytes_read);
+		ret_read = pread(fd, buf, sectorsize, file_pos + bytes_read);
 		if (ret_read == -1) {
-			error("cannot read %s at offset %llu length %llu: %m",
-				path_name,
-				(unsigned long long)file_pos + bytes_read,
-				(unsigned long long)sectorsize);
+			error("cannot read %s at offset %llu length %u: %m",
+				path_name, file_pos + bytes_read, sectorsize);
 			goto end;
 		}
 
-		eb->start = first_block + bytes_read;
-		eb->len = sectorsize;
-
-		/*
-		 * we're doing the csum before we record the extent, but
-		 * that's ok
-		 */
-		ret = btrfs_csum_file_block(trans, root->fs_info->csum_root,
-				first_block + bytes_read + sectorsize,
-				first_block + bytes_read,
-				eb->data, sectorsize);
-		if (ret)
-			goto end;
-
-		ret = write_and_map_eb(root->fs_info, eb);
+		ret = write_data_to_disk(root->fs_info, buf,
+					 first_block + bytes_read, sectorsize);
 		if (ret) {
 			error("failed to write %s", path_name);
 			goto end;
 		}
+
+		ret = btrfs_csum_file_block(trans, first_block + bytes_read,
+					    BTRFS_EXTENT_CSUM_OBJECTID,
+					    fs_info->csum_type, buf);
+		if (ret)
+			goto end;
 
 		bytes_read += sectorsize;
 	}
@@ -431,8 +424,70 @@ again:
 		goto again;
 
 end:
-	free(eb);
+	free(buf);
 	close(fd);
+	return ret;
+}
+
+static int copy_rootdir_inode(struct btrfs_trans_handle *trans,
+			      struct btrfs_root *root, const char *dir_name)
+{
+	u64 root_dir_inode_size;
+	struct btrfs_inode_item *inode_item;
+	struct btrfs_path path = { 0 };
+	struct btrfs_key key;
+	struct extent_buffer *leaf;
+	struct stat st;
+	int ret;
+
+	ret = stat(dir_name, &st);
+	if (ret < 0) {
+		ret = -errno;
+		error("stat failed for directory %s: %m", dir_name);
+		return ret;
+	}
+
+	ret = add_xattr_item(trans, root, btrfs_root_dirid(&root->root_item), dir_name);
+	if (ret < 0) {
+		errno = -ret;
+		error("failed to add xattr item for the top level inode: %m");
+		return ret;
+	}
+
+	key.objectid = btrfs_root_dirid(&root->root_item);
+	key.type = BTRFS_INODE_ITEM_KEY;
+	key.offset = 0;
+	ret = btrfs_lookup_inode(trans, root, &path, &key, 1);
+	if (ret > 0)
+		ret = -ENOENT;
+	if (ret) {
+		error("failed to lookup root dir: %d", ret);
+		goto error;
+	}
+
+	leaf = path.nodes[0];
+	inode_item = btrfs_item_ptr(leaf, path.slots[0], struct btrfs_inode_item);
+
+	root_dir_inode_size = calculate_dir_inode_size(dir_name);
+	btrfs_set_inode_size(leaf, inode_item, root_dir_inode_size);
+
+	/* Unlike fill_inode_item, we only need to copy part of the attributes. */
+	btrfs_set_inode_uid(leaf, inode_item, st.st_uid);
+	btrfs_set_inode_gid(leaf, inode_item, st.st_gid);
+	btrfs_set_inode_mode(leaf, inode_item, st.st_mode);
+	btrfs_set_timespec_sec(leaf, &inode_item->atime, st.st_atime);
+	btrfs_set_timespec_nsec(leaf, &inode_item->atime, 0);
+	btrfs_set_timespec_sec(leaf, &inode_item->ctime, st.st_ctime);
+	btrfs_set_timespec_nsec(leaf, &inode_item->ctime, 0);
+	btrfs_set_timespec_sec(leaf, &inode_item->mtime, st.st_mtime);
+	btrfs_set_timespec_nsec(leaf, &inode_item->mtime, 0);
+	/* FIXME */
+	btrfs_set_timespec_sec(leaf, &inode_item->otime, 0);
+	btrfs_set_timespec_nsec(leaf, &inode_item->otime, 0);
+	btrfs_mark_buffer_dirty(leaf);
+
+error:
+	btrfs_release_path(&path);
 	return ret;
 }
 
@@ -443,19 +498,14 @@ static int traverse_directory(struct btrfs_trans_handle *trans,
 	int ret = 0;
 
 	struct btrfs_inode_item cur_inode;
-	struct btrfs_inode_item *inode_item;
 	int count, i, dir_index_cnt;
-	struct direct **files;
+	struct dirent **files;
 	struct stat st;
 	struct directory_name_entry *dir_entry, *parent_dir_entry;
-	struct direct *cur_file;
+	struct dirent *cur_file;
 	ino_t parent_inum, cur_inum;
 	ino_t highest_inum = 0;
 	const char *parent_dir_name;
-	struct btrfs_path path;
-	struct extent_buffer *leaf;
-	struct btrfs_key root_dir_key;
-	u64 root_dir_inode_size = 0;
 
 	/* Add list for source directory */
 	dir_entry = malloc(sizeof(struct directory_name_entry));
@@ -473,26 +523,12 @@ static int traverse_directory(struct btrfs_trans_handle *trans,
 	dir_entry->inum = parent_inum;
 	list_add_tail(&dir_entry->list, &dir_head->list);
 
-	btrfs_init_path(&path);
-
-	root_dir_key.objectid = btrfs_root_dirid(&root->root_item);
-	root_dir_key.offset = 0;
-	root_dir_key.type = BTRFS_INODE_ITEM_KEY;
-	ret = btrfs_lookup_inode(trans, root, &path, &root_dir_key, 1);
-	if (ret) {
-		error("failed to lookup root dir: %d", ret);
+	ret = copy_rootdir_inode(trans, root, dir_name);
+	if (ret < 0) {
+		errno = -ret;
+		error("failed to copy rootdir inode: %m");
 		goto fail_no_dir;
 	}
-
-	leaf = path.nodes[0];
-	inode_item = btrfs_item_ptr(leaf, path.slots[0],
-				    struct btrfs_inode_item);
-
-	root_dir_inode_size = calculate_dir_inode_size(dir_name);
-	btrfs_set_inode_size(leaf, inode_item, root_dir_inode_size);
-	btrfs_mark_buffer_dirty(leaf);
-
-	btrfs_release_path(&path);
 
 	do {
 		parent_dir_entry = list_entry(dir_head->list.next,
@@ -519,6 +555,8 @@ static int traverse_directory(struct btrfs_trans_handle *trans,
 		}
 
 		for (i = 0; i < count; i++) {
+			char tmp[PATH_MAX];
+
 			cur_file = files[i];
 
 			if (lstat(cur_file->d_name, &st) == -1) {
@@ -527,8 +565,18 @@ static int traverse_directory(struct btrfs_trans_handle *trans,
 				ret = -1;
 				goto fail;
 			}
+			if (bconf.verbose >= LOG_INFO) {
+				path_cat_out(tmp, parent_dir_entry->path, cur_file->d_name);
+				pr_verbose(LOG_INFO, "ADD: %s\n", tmp);
+			}
 
-			cur_inum = st.st_ino;
+			/*
+			 * We can not directly use the source ino number,
+			 * as there is a chance that the ino is smaller than
+			 * BTRFS_FIRST_FREE_OBJECTID, which will screw up
+			 * backref code.
+			 */
+			cur_inum = st.st_ino + BTRFS_FIRST_FREE_OBJECTID;
 			ret = add_directory_items(trans, root,
 						  cur_inum, parent_inum,
 						  cur_file->d_name,
@@ -569,8 +617,6 @@ static int traverse_directory(struct btrfs_trans_handle *trans,
 			}
 
 			if (S_ISDIR(st.st_mode)) {
-				char tmp[PATH_MAX];
-
 				dir_entry = malloc(sizeof(*dir_entry));
 				if (!dir_entry) {
 					ret = -ENOMEM;
@@ -587,7 +633,7 @@ static int traverse_directory(struct btrfs_trans_handle *trans,
 				}
 				dir_entry->path = strdup(tmp);
 				if (!dir_entry->path) {
-					error("not enough memory to store path");
+					error_msg(ERROR_MSG_MEMORY, NULL);
 					ret = -ENOMEM;
 					goto fail;
 				}
@@ -634,8 +680,7 @@ fail_no_dir:
 	goto out;
 }
 
-int btrfs_mkfs_fill_dir(const char *source_dir, struct btrfs_root *root,
-			bool verbose)
+int btrfs_mkfs_fill_dir(const char *source_dir, struct btrfs_root *root)
 {
 	int ret;
 	struct btrfs_trans_handle *trans;
@@ -653,7 +698,13 @@ int btrfs_mkfs_fill_dir(const char *source_dir, struct btrfs_root *root,
 	INIT_LIST_HEAD(&dir_head.list);
 
 	trans = btrfs_start_transaction(root, 1);
-	BUG_ON(IS_ERR(trans));
+	if (IS_ERR(trans)) {
+		ret = PTR_ERR(trans);
+		errno = -ret;
+		error_msg(ERROR_MSG_START_TRANS, "%m");
+		goto fail;
+}
+
 	ret = traverse_directory(trans, root, source_dir, &dir_head);
 	if (ret) {
 		error("unable to traverse directory %s: %d", source_dir, ret);
@@ -661,12 +712,11 @@ int btrfs_mkfs_fill_dir(const char *source_dir, struct btrfs_root *root,
 	}
 	ret = btrfs_commit_transaction(trans, root);
 	if (ret) {
-		error("transaction commit failed: %d", ret);
+		errno = -ret;
+		error_msg(ERROR_MSG_COMMIT_TRANS, "%m");
 		goto out;
 	}
 
-	if (verbose)
-		printf("Making image is completed.\n");
 	return 0;
 fail:
 	/*
@@ -794,7 +844,7 @@ static int get_device_extent_end(struct btrfs_fs_info *fs_info,
 {
 	struct btrfs_root *dev_root = fs_info->dev_root;
 	struct btrfs_key key;
-	struct btrfs_path path;
+	struct btrfs_path path = { 0 };
 	struct btrfs_dev_extent *de;
 	int ret;
 
@@ -802,10 +852,12 @@ static int get_device_extent_end(struct btrfs_fs_info *fs_info,
 	key.type = BTRFS_DEV_EXTENT_KEY;
 	key.offset = (u64)-1;
 
-	btrfs_init_path(&path);
 	ret = btrfs_search_slot(NULL, dev_root, &key, &path, 0, 0);
-	/* Not really possible */
-	BUG_ON(ret == 0);
+	if (ret == 0) {
+		error("DEV_EXTENT for devid %llu not found", devid);
+		ret = -EUCLEAN;
+		goto out;
+	}
 
 	ret = btrfs_previous_item(dev_root, &path, devid, BTRFS_DEV_EXTENT_KEY);
 	if (ret < 0)
@@ -843,7 +895,7 @@ static int set_device_size(struct btrfs_fs_info *fs_info,
 	struct btrfs_root *chunk_root = fs_info->chunk_root;
 	struct btrfs_trans_handle *trans;
 	struct btrfs_dev_item *di;
-	struct btrfs_path path;
+	struct btrfs_path path = { 0 };
 	struct btrfs_key key;
 	int ret;
 
@@ -852,14 +904,13 @@ static int set_device_size(struct btrfs_fs_info *fs_info,
 	 * super->dev_item will also get updated
 	 */
 	device->total_bytes = new_size;
-	btrfs_init_path(&path);
 
 	/* Update device item in chunk tree */
 	trans = btrfs_start_transaction(chunk_root, 1);
 	if (IS_ERR(trans)) {
 		ret = PTR_ERR(trans);
 		errno = -ret;
-		error("failed to start transaction: %d (%m)", ret);
+		error_msg(ERROR_MSG_START_TRANS, "%m");
 		return ret;
 	}
 	key.objectid = BTRFS_DEV_ITEMS_OBJECTID;
@@ -889,7 +940,7 @@ static int set_device_size(struct btrfs_fs_info *fs_info,
 	ret = btrfs_commit_transaction(trans, chunk_root);
 	if (ret < 0) {
 		errno = -ret;
-		error("failed to commit current transaction: %d (%m)", ret);
+		error_msg(ERROR_MSG_COMMIT_TRANS, "%m");
 	}
 	btrfs_release_path(&path);
 	return ret;
@@ -911,7 +962,7 @@ int btrfs_mkfs_shrink_fs(struct btrfs_fs_info *fs_info, u64 *new_size_ret,
 	u64 new_size;
 	struct btrfs_device *device;
 	struct list_head *cur;
-	struct stat64 file_stat;
+	struct stat file_stat;
 	int nr_devs = 0;
 	int ret;
 
@@ -930,7 +981,11 @@ int btrfs_mkfs_shrink_fs(struct btrfs_fs_info *fs_info, u64 *new_size_ret,
 		return ret;
 	}
 
-	BUG_ON(!IS_ALIGNED(new_size, fs_info->sectorsize));
+	if (!IS_ALIGNED(new_size, fs_info->sectorsize)) {
+		error("shrunk filesystem size %llu not aligned to %u",
+				new_size, fs_info->sectorsize);
+		return -EUCLEAN;
+	}
 
 	device = list_entry(fs_info->fs_devices->devices.next,
 			   struct btrfs_device, dev_list);
@@ -941,14 +996,14 @@ int btrfs_mkfs_shrink_fs(struct btrfs_fs_info *fs_info, u64 *new_size_ret,
 		*new_size_ret = new_size;
 
 	if (shrink_file_size) {
-		ret = fstat64(device->fd, &file_stat);
+		ret = fstat(device->fd, &file_stat);
 		if (ret < 0) {
 			error("failed to stat devid %llu: %m", device->devid);
 			return ret;
 		}
 		if (!S_ISREG(file_stat.st_mode))
 			return ret;
-		ret = ftruncate64(device->fd, new_size);
+		ret = ftruncate(device->fd, new_size);
 		if (ret < 0) {
 			error("failed to truncate device file of devid %llu: %m",
 				device->devid);

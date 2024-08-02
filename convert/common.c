@@ -14,12 +14,24 @@
  * Boston, MA 021110-1307, USA.
  */
 
+#include "kerncompat.h"
+#include <sys/stat.h>
 #include <unistd.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
 #include <uuid/uuid.h>
+#include "kernel-lib/sizes.h"
+#include "kernel-shared/ctree.h"
+#include "kernel-shared/extent_io.h"
 #include "kernel-shared/disk-io.h"
 #include "kernel-shared/volumes.h"
-#include "common/utils.h"
+#include "kernel-shared/accessors.h"
+#include "kernel-shared/uapi/btrfs_tree.h"
 #include "common/path-utils.h"
+#include "common/messages.h"
+#include "common/string-utils.h"
+#include "common/fsfeatures.h"
 #include "mkfs/common.h"
 #include "convert/common.h"
 
@@ -36,7 +48,7 @@ static int reserve_free_space(struct cache_tree *free_tree, u64 len,
 	struct cache_extent *cache;
 	int found = 0;
 
-	ASSERT(ret_start != NULL);
+	UASSERT(ret_start != NULL);
 	cache = first_cache_extent(free_tree);
 	while (cache) {
 		if (cache->size > len) {
@@ -66,7 +78,7 @@ static inline int write_temp_super(int fd, struct btrfs_super_block *sb,
        u16 csum_type = btrfs_super_csum_type(sb);
        int ret;
 
-       btrfs_csum_data(csum_type, (u8 *)sb + BTRFS_CSUM_SIZE,
+       btrfs_csum_data(NULL, csum_type, (u8 *)sb + BTRFS_CSUM_SIZE,
 		       result, BTRFS_SUPER_INFO_SIZE - BTRFS_CSUM_SIZE);
        memcpy(&sb->csum[0], result, BTRFS_CSUM_SIZE);
        ret = pwrite(fd, sb, BTRFS_SUPER_INFO_SIZE, sb_bytenr);
@@ -91,61 +103,58 @@ static int setup_temp_super(int fd, struct btrfs_mkfs_config *cfg,
 			    u64 root_bytenr, u64 chunk_bytenr)
 {
 	unsigned char chunk_uuid[BTRFS_UUID_SIZE];
-	char super_buf[BTRFS_SUPER_INFO_SIZE];
-	struct btrfs_super_block *super = (struct btrfs_super_block *)super_buf;
+	struct btrfs_super_block super = {};
 	int ret;
 
-	memset(super_buf, 0, BTRFS_SUPER_INFO_SIZE);
 	cfg->num_bytes = round_down(cfg->num_bytes, cfg->sectorsize);
 
 	if (*cfg->fs_uuid) {
-		if (uuid_parse(cfg->fs_uuid, super->fsid) != 0) {
+		if (uuid_parse(cfg->fs_uuid, super.fsid) != 0) {
 			error("could not parse UUID: %s", cfg->fs_uuid);
 			ret = -EINVAL;
 			goto out;
 		}
-		if (!test_uuid_unique(cfg->fs_uuid)) {
-			error("non-unique UUID: %s", cfg->fs_uuid);
-			ret = -EINVAL;
-			goto out;
-		}
-		uuid_copy(super->metadata_uuid, super->fsid);
+		/*
+		 * Caller should make sure the uuid is either unique or OK to
+		 * be duplicate in case it's copied from the source filesystem.
+		 */
+		uuid_copy(super.metadata_uuid, super.fsid);
 	} else {
-		uuid_generate(super->fsid);
-		uuid_unparse(super->fsid, cfg->fs_uuid);
-		uuid_copy(super->metadata_uuid, super->fsid);
+		uuid_generate(super.fsid);
+		uuid_unparse(super.fsid, cfg->fs_uuid);
+		uuid_copy(super.metadata_uuid, super.fsid);
 	}
 	uuid_generate(chunk_uuid);
 	uuid_unparse(chunk_uuid, cfg->chunk_uuid);
 
-	btrfs_set_super_bytenr(super, cfg->super_bytenr);
-	btrfs_set_super_num_devices(super, 1);
-	btrfs_set_super_magic(super, BTRFS_MAGIC_TEMPORARY);
-	btrfs_set_super_generation(super, 1);
-	btrfs_set_super_root(super, root_bytenr);
-	btrfs_set_super_chunk_root(super, chunk_bytenr);
-	btrfs_set_super_total_bytes(super, cfg->num_bytes);
+	btrfs_set_super_bytenr(&super, cfg->super_bytenr);
+	btrfs_set_super_num_devices(&super, 1);
+	btrfs_set_super_magic(&super, BTRFS_MAGIC_TEMPORARY);
+	btrfs_set_super_generation(&super, 1);
+	btrfs_set_super_root(&super, root_bytenr);
+	btrfs_set_super_chunk_root(&super, chunk_bytenr);
+	btrfs_set_super_total_bytes(&super, cfg->num_bytes);
 	/*
 	 * Temporary filesystem will only have 6 tree roots:
 	 * chunk tree, root tree, extent_tree, device tree, fs tree
 	 * and csum tree.
 	 */
-	btrfs_set_super_bytes_used(super, 6 * cfg->nodesize);
-	btrfs_set_super_sectorsize(super, cfg->sectorsize);
-	super->__unused_leafsize = cpu_to_le32(cfg->nodesize);
-	btrfs_set_super_nodesize(super, cfg->nodesize);
-	btrfs_set_super_stripesize(super, cfg->stripesize);
-	btrfs_set_super_csum_type(super, cfg->csum_type);
-	btrfs_set_super_chunk_root(super, chunk_bytenr);
-	btrfs_set_super_cache_generation(super, -1);
-	btrfs_set_super_incompat_flags(super, cfg->features);
+	btrfs_set_super_bytes_used(&super, 6 * cfg->nodesize);
+	btrfs_set_super_sectorsize(&super, cfg->sectorsize);
+	super.__unused_leafsize = cpu_to_le32(cfg->nodesize);
+	btrfs_set_super_nodesize(&super, cfg->nodesize);
+	btrfs_set_super_stripesize(&super, cfg->stripesize);
+	btrfs_set_super_csum_type(&super, cfg->csum_type);
+	btrfs_set_super_chunk_root(&super, chunk_bytenr);
+	btrfs_set_super_cache_generation(&super, -1);
+	btrfs_set_super_incompat_flags(&super, cfg->features.incompat_flags);
 	if (cfg->label)
-		__strncpy_null(super->label, cfg->label, BTRFS_LABEL_SIZE - 1);
+		strncpy_null(super.label, cfg->label, BTRFS_LABEL_SIZE);
 
 	/* Sys chunk array will be re-initialized at chunk tree init time */
-	super->sys_chunk_array_size = 0;
+	super.sys_chunk_array_size = 0;
 
-	ret = write_temp_super(fd, super, cfg->super_bytenr);
+	ret = write_temp_super(fd, &super, cfg->super_bytenr);
 out:
 	return ret;
 }
@@ -207,8 +216,8 @@ static void insert_temp_root_item(struct extent_buffer *buf,
 	btrfs_set_disk_key_offset(&disk_key, 0);
 
 	btrfs_set_item_key(buf, &disk_key, *slot);
-	btrfs_set_item_offset(buf, btrfs_item_nr(*slot), *itemoff);
-	btrfs_set_item_size(buf, btrfs_item_nr(*slot), sizeof(root_item));
+	btrfs_set_item_offset(buf, *slot, *itemoff);
+	btrfs_set_item_size(buf, *slot, sizeof(root_item));
 	write_extent_buffer(buf, &root_item,
 			    btrfs_item_ptr_offset(buf, *slot),
 			    sizeof(root_item));
@@ -241,7 +250,7 @@ static int setup_temp_root_tree(int fd, struct btrfs_mkfs_config *cfg,
 				u64 dev_bytenr, u64 fs_bytenr, u64 csum_bytenr)
 {
 	struct extent_buffer *buf = NULL;
-	u32 itemoff = __BTRFS_LEAF_DATA_SIZE(cfg->nodesize);
+	u32 itemoff = cfg->leaf_data_size;
 	int slot = 0;
 	int ret;
 
@@ -256,14 +265,10 @@ static int setup_temp_root_tree(int fd, struct btrfs_mkfs_config *cfg,
 				"extent < dev %llu < %llu, "
 				"dev < fs %llu < %llu, "
 				"fs < csum %llu < %llu",
-				(unsigned long long)root_bytenr,
-				(unsigned long long)extent_bytenr,
-				(unsigned long long)extent_bytenr,
-				(unsigned long long)dev_bytenr,
-				(unsigned long long)dev_bytenr,
-				(unsigned long long)fs_bytenr,
-				(unsigned long long)fs_bytenr,
-				(unsigned long long)csum_bytenr);
+				root_bytenr, extent_bytenr,
+				extent_bytenr, dev_bytenr,
+				dev_bytenr, fs_bytenr,
+				fs_bytenr, csum_bytenr);
 		return -EINVAL;
 	}
 	buf = malloc(sizeof(*buf) + cfg->nodesize);
@@ -296,13 +301,12 @@ static int insert_temp_dev_item(int fd, struct extent_buffer *buf,
 {
 	struct btrfs_disk_key disk_key;
 	struct btrfs_dev_item *dev_item;
-	char super_buf[BTRFS_SUPER_INFO_SIZE];
 	unsigned char dev_uuid[BTRFS_UUID_SIZE];
 	unsigned char fsid[BTRFS_FSID_SIZE];
-	struct btrfs_super_block *super = (struct btrfs_super_block *)super_buf;
+	struct btrfs_super_block super;
 	int ret;
 
-	ret = pread(fd, super_buf, BTRFS_SUPER_INFO_SIZE, cfg->super_bytenr);
+	ret = pread(fd, &super, BTRFS_SUPER_INFO_SIZE, cfg->super_bytenr);
 	if (ret < BTRFS_SUPER_INFO_SIZE) {
 		ret = (ret < 0 ? -errno : -EIO);
 		goto out;
@@ -315,8 +319,8 @@ static int insert_temp_dev_item(int fd, struct extent_buffer *buf,
 	btrfs_set_disk_key_objectid(&disk_key, BTRFS_DEV_ITEMS_OBJECTID);
 	btrfs_set_disk_key_offset(&disk_key, 1);
 	btrfs_set_item_key(buf, &disk_key, *slot);
-	btrfs_set_item_offset(buf, btrfs_item_nr(*slot), *itemoff);
-	btrfs_set_item_size(buf, btrfs_item_nr(*slot), sizeof(*dev_item));
+	btrfs_set_item_offset(buf, *slot, *itemoff);
+	btrfs_set_item_size(buf, *slot, sizeof(*dev_item));
 
 	dev_item = btrfs_item_ptr(buf, *slot, struct btrfs_dev_item);
 	/* Generate device uuid */
@@ -343,9 +347,9 @@ static int insert_temp_dev_item(int fd, struct extent_buffer *buf,
 	btrfs_set_device_type(buf, dev_item, 0);
 
 	/* Super dev_item is not complete, copy the complete one to sb */
-	read_extent_buffer(buf, &super->dev_item, (unsigned long)dev_item,
+	read_extent_buffer(buf, &super.dev_item, (unsigned long)dev_item,
 			   sizeof(*dev_item));
-	ret = write_temp_super(fd, super, cfg->super_bytenr);
+	ret = write_temp_super(fd, &super, cfg->super_bytenr);
 	(*slot)++;
 out:
 	return ret;
@@ -358,12 +362,10 @@ static int insert_temp_chunk_item(int fd, struct extent_buffer *buf,
 {
 	struct btrfs_chunk *chunk;
 	struct btrfs_disk_key disk_key;
-	char super_buf[BTRFS_SUPER_INFO_SIZE];
-	struct btrfs_super_block *sb = (struct btrfs_super_block *)super_buf;
+	struct btrfs_super_block sb;
 	int ret = 0;
 
-	ret = pread(fd, super_buf, BTRFS_SUPER_INFO_SIZE,
-		    cfg->super_bytenr);
+	ret = pread(fd, &sb, BTRFS_SUPER_INFO_SIZE, cfg->super_bytenr);
 	if (ret < BTRFS_SUPER_INFO_SIZE) {
 		ret = (ret < 0 ? ret : -EIO);
 		return ret;
@@ -375,9 +377,8 @@ static int insert_temp_chunk_item(int fd, struct extent_buffer *buf,
 	btrfs_set_disk_key_objectid(&disk_key, BTRFS_FIRST_CHUNK_TREE_OBJECTID);
 	btrfs_set_disk_key_offset(&disk_key, start);
 	btrfs_set_item_key(buf, &disk_key, *slot);
-	btrfs_set_item_offset(buf, btrfs_item_nr(*slot), *itemoff);
-	btrfs_set_item_size(buf, btrfs_item_nr(*slot),
-			    btrfs_chunk_item_size(1));
+	btrfs_set_item_offset(buf, *slot, *itemoff);
+	btrfs_set_item_size(buf, *slot, btrfs_chunk_item_size(1));
 
 	chunk = btrfs_item_ptr(buf, *slot, struct btrfs_chunk);
 	btrfs_set_chunk_length(buf, chunk, len);
@@ -392,7 +393,7 @@ static int insert_temp_chunk_item(int fd, struct extent_buffer *buf,
 	btrfs_set_stripe_devid_nr(buf, chunk, 0, 1);
 	/* We are doing 1:1 mapping, so start is its dev offset */
 	btrfs_set_stripe_offset_nr(buf, chunk, 0, start);
-	write_extent_buffer(buf, &sb->dev_item.uuid,
+	write_extent_buffer(buf, sb.dev_item.uuid,
 			    (unsigned long)btrfs_stripe_dev_uuid_nr(chunk, 0),
 			    BTRFS_UUID_SIZE);
 	(*slot)++;
@@ -404,18 +405,18 @@ static int insert_temp_chunk_item(int fd, struct extent_buffer *buf,
 		char *cur;
 		u32 array_size;
 
-		cur = (char *)sb->sys_chunk_array
-			+ btrfs_super_sys_array_size(sb);
+		cur = (char *)sb.sys_chunk_array
+			+ btrfs_super_sys_array_size(&sb);
 		memcpy(cur, &disk_key, sizeof(disk_key));
 		cur += sizeof(disk_key);
 		read_extent_buffer(buf, cur, (unsigned long int)chunk,
 				   btrfs_chunk_item_size(1));
-		array_size = btrfs_super_sys_array_size(sb);
+		array_size = btrfs_super_sys_array_size(&sb);
 		array_size += btrfs_chunk_item_size(1) +
 					    sizeof(disk_key);
-		btrfs_set_super_sys_array_size(sb, array_size);
+		btrfs_set_super_sys_array_size(&sb, array_size);
 
-		ret = write_temp_super(fd, sb, cfg->super_bytenr);
+		ret = write_temp_super(fd, &sb, cfg->super_bytenr);
 	}
 	return ret;
 }
@@ -425,15 +426,14 @@ static int setup_temp_chunk_tree(int fd, struct btrfs_mkfs_config *cfg,
 				 u64 chunk_bytenr)
 {
 	struct extent_buffer *buf = NULL;
-	u32 itemoff = __BTRFS_LEAF_DATA_SIZE(cfg->nodesize);
+	u32 itemoff = cfg->leaf_data_size;
 	int slot = 0;
 	int ret;
 
 	/* Must ensure SYS chunk starts before META chunk */
 	if (meta_chunk_start < sys_chunk_start) {
 		error("wrong chunk order: meta < system %llu < %llu",
-				(unsigned long long)meta_chunk_start,
-				(unsigned long long)sys_chunk_start);
+				meta_chunk_start, sys_chunk_start);
 		return -EINVAL;
 	}
 	buf = malloc(sizeof(*buf) + cfg->nodesize);
@@ -478,8 +478,8 @@ static void insert_temp_dev_extent(struct extent_buffer *buf,
 	btrfs_set_disk_key_objectid(&disk_key, 1);
 	btrfs_set_disk_key_offset(&disk_key, start);
 	btrfs_set_item_key(buf, &disk_key, *slot);
-	btrfs_set_item_offset(buf, btrfs_item_nr(*slot), *itemoff);
-	btrfs_set_item_size(buf, btrfs_item_nr(*slot), sizeof(*dev_extent));
+	btrfs_set_item_offset(buf, *slot, *itemoff);
+	btrfs_set_item_size(buf, *slot, sizeof(*dev_extent));
 
 	dev_extent = btrfs_item_ptr(buf, *slot, struct btrfs_dev_extent);
 	btrfs_set_dev_extent_chunk_objectid(buf, dev_extent,
@@ -496,15 +496,14 @@ static int setup_temp_dev_tree(int fd, struct btrfs_mkfs_config *cfg,
 			       u64 dev_bytenr)
 {
 	struct extent_buffer *buf = NULL;
-	u32 itemoff = __BTRFS_LEAF_DATA_SIZE(cfg->nodesize);
+	u32 itemoff = cfg->leaf_data_size;
 	int slot = 0;
 	int ret;
 
 	/* Must ensure SYS chunk starts before META chunk */
 	if (meta_chunk_start < sys_chunk_start) {
 		error("wrong chunk order: meta < system %llu < %llu",
-				(unsigned long long)meta_chunk_start,
-				(unsigned long long)sys_chunk_start);
+				meta_chunk_start, sys_chunk_start);
 		return -EINVAL;
 	}
 	buf = malloc(sizeof(*buf) + cfg->nodesize);
@@ -587,7 +586,7 @@ static int insert_temp_extent_item(int fd, struct extent_buffer *buf,
 	struct btrfs_disk_key tree_info_key;
 	struct btrfs_tree_block_info *info;
 	int itemsize;
-	int skinny_metadata = cfg->features &
+	int skinny_metadata = cfg->features.incompat_flags &
 			      BTRFS_FEATURE_INCOMPAT_SKINNY_METADATA;
 	int ret;
 
@@ -610,8 +609,8 @@ static int insert_temp_extent_item(int fd, struct extent_buffer *buf,
 	btrfs_set_disk_key_objectid(&disk_key, bytenr);
 
 	btrfs_set_item_key(buf, &disk_key, *slot);
-	btrfs_set_item_offset(buf, btrfs_item_nr(*slot), *itemoff);
-	btrfs_set_item_size(buf, btrfs_item_nr(*slot), itemsize);
+	btrfs_set_item_offset(buf, *slot, *itemoff);
+	btrfs_set_item_size(buf, *slot, itemsize);
 
 	ei = btrfs_item_ptr(buf, *slot, struct btrfs_extent_item);
 	btrfs_set_extent_refs(buf, ei, 1);
@@ -676,8 +675,8 @@ static void insert_temp_block_group(struct extent_buffer *buf,
 	btrfs_set_disk_key_objectid(&disk_key, bytenr);
 	btrfs_set_disk_key_offset(&disk_key, len);
 	btrfs_set_item_key(buf, &disk_key, *slot);
-	btrfs_set_item_offset(buf, btrfs_item_nr(*slot), *itemoff);
-	btrfs_set_item_size(buf, btrfs_item_nr(*slot), sizeof(bgi));
+	btrfs_set_item_offset(buf, *slot, *itemoff);
+	btrfs_set_item_size(buf, *slot, sizeof(bgi));
 
 	btrfs_set_stack_block_group_flags(&bgi, flag);
 	btrfs_set_stack_block_group_used(&bgi, used);
@@ -694,7 +693,7 @@ static int setup_temp_extent_tree(int fd, struct btrfs_mkfs_config *cfg,
 				  u64 fs_bytenr, u64 csum_bytenr)
 {
 	struct extent_buffer *buf = NULL;
-	u32 itemoff = __BTRFS_LEAF_DATA_SIZE(cfg->nodesize);
+	u32 itemoff = cfg->leaf_data_size;
 	int slot = 0;
 	int ret;
 
@@ -711,16 +710,11 @@ static int setup_temp_extent_tree(int fd, struct btrfs_mkfs_config *cfg,
 				"extent < dev %llu < %llu, "
 				"dev < fs %llu < %llu, "
 				"fs < csum %llu < %llu",
-				(unsigned long long)chunk_bytenr,
-				(unsigned long long)root_bytenr,
-				(unsigned long long)root_bytenr,
-				(unsigned long long)extent_bytenr,
-				(unsigned long long)extent_bytenr,
-				(unsigned long long)dev_bytenr,
-				(unsigned long long)dev_bytenr,
-				(unsigned long long)fs_bytenr,
-				(unsigned long long)fs_bytenr,
-				(unsigned long long)csum_bytenr);
+				chunk_bytenr, root_bytenr,
+				root_bytenr, extent_bytenr,
+				extent_bytenr, dev_bytenr,
+				dev_bytenr, fs_bytenr,
+				fs_bytenr, csum_bytenr);
 		return -EINVAL;
 	}
 	buf = malloc(sizeof(*buf) + cfg->nodesize);
@@ -817,7 +811,7 @@ int make_convert_btrfs(int fd, struct btrfs_mkfs_config *cfg,
 	int ret;
 
 	/* Source filesystem must be opened, checked and analyzed in advance */
-	ASSERT(!cache_tree_empty(used_space));
+	UASSERT(!cache_tree_empty(used_space));
 
 	/*
 	 * reserve space for temporary superblock first

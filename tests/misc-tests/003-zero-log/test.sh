@@ -1,7 +1,7 @@
 #!/bin/bash
 # test zero-log
 
-source "$TEST_TOP/common"
+source "$TEST_TOP/common" || exit
 
 check_prereq mkfs.btrfs
 check_prereq btrfs
@@ -19,6 +19,9 @@ get_log_root_level() {
 
 test_zero_log()
 {
+	local log_root
+	local log_root_level
+
 	# FIXME: we need an image with existing log_root
 	run_check_mkfs_test_dev --rootdir "$INTERNAL_BIN/Documentation"
 	run_check "$TOP/btrfs" inspect-internal dump-super "$TEST_DEV"

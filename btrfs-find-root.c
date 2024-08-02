@@ -16,25 +16,24 @@
  * Boston, MA 021110-1307, USA.
  */
 
+#include "kerncompat.h"
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <zlib.h>
 #include <getopt.h>
-
-#include "kerncompat.h"
+#include <errno.h>
+#include <unistd.h>
+#include "kernel-shared/accessors.h"
+#include "kernel-shared/uapi/btrfs_tree.h"
 #include "kernel-shared/ctree.h"
 #include "kernel-shared/disk-io.h"
-#include "kernel-shared/print-tree.h"
-#include "kernel-shared/transaction.h"
-#include "kernel-lib/list.h"
 #include "kernel-shared/volumes.h"
-#include "common/utils.h"
-#include "crypto/crc32c.h"
+#include "kernel-shared/extent_io.h"
+#include "kernel-shared/tree-checker.h"
+#include "common/box.h"
 #include "common/extent-cache.h"
 #include "common/help.h"
+#include "common/messages.h"
+#include "common/string-utils.h"
 #include "cmds/commands.h"
 
 /*
@@ -204,7 +203,9 @@ int btrfs_find_root_search(struct btrfs_fs_info *fs_info,
 		for (offset = chunk_offset;
 		     offset < chunk_offset + chunk_size;
 		     offset += nodesize) {
-			eb = read_tree_block(fs_info, offset, 0);
+			struct btrfs_tree_parent_check check = { 0 };
+
+			eb = read_tree_block(fs_info, offset, &check);
 			if (!eb || IS_ERR(eb))
 				continue;
 			ret = add_eb_to_result(eb, result, nodesize, filter,
@@ -249,7 +250,7 @@ static void get_root_gen_and_level(u64 objectid, struct btrfs_fs_info *fs_info,
 		break;
 	case BTRFS_TREE_LOG_OBJECTID:
 		level = btrfs_super_log_root_level(super);
-		gen = btrfs_super_log_root_transid(super);
+		gen = btrfs_super_generation(super) + 1;
 		break;
 	case BTRFS_UUID_TREE_OBJECTID:
 		gen = btrfs_super_uuid_tree_generation(super);
@@ -319,26 +320,28 @@ static void print_find_root_result(struct cache_tree *result,
 	}
 }
 
-static const char * btrfs_find_root_usage[] = {
+static const char * const btrfs_find_root_usage[] = {
 	"btrfs-find-usage [options] <device>",
 	"Attempt to find tree roots on the device",
 	"",
-	"  -a              search through all metadata even if the root has been found",
-	"  -o OBJECTID     filter by the tree's object id",
-	"  -l LEVEL        filter by tree level, (default: 0)",
-	"  -g GENERATION   filter by tree generation",
+	OPTLINE("-a", "search through all metadata even if the root has been found"),
+	OPTLINE("-o OBJECTID", "filter by the tree's object id"),
+	OPTLINE("-l LEVEL", "filter by tree level, (default: 0)"),
+	OPTLINE("-g GENERATION", "filter by tree generation"),
+	NULL
 };
 
 static const struct cmd_struct btrfs_find_root_cmd = {
 	"btrfs-find-root", NULL, btrfs_find_root_usage, NULL, 0,
 };
 
-int main(int argc, char **argv)
+int BOX_MAIN(find_root)(int argc, char **argv)
 {
 	struct btrfs_fs_info *fs_info;
 	struct btrfs_find_root_filter filter = {0};
 	struct cache_tree result;
 	struct cache_extent *found;
+	struct open_ctree_args oca = { 0 };
 	int ret;
 
 	/* Default to search root tree */
@@ -370,10 +373,10 @@ int main(int argc, char **argv)
 			filter.level = arg_strtou64(optarg);
 			break;
 		case GETOPT_VAL_HELP:
-			usage_command(&btrfs_find_root_cmd, 0, 0);
+			usage(&btrfs_find_root_cmd, 0);
 			return 0;
 		default:
-			usage_unknown_option(&btrfs_find_root_cmd, argv);
+			usage(&btrfs_find_root_cmd, 1);
 		}
 	}
 
@@ -381,9 +384,9 @@ int main(int argc, char **argv)
 	if (check_argc_min(argc - optind, 1))
 		return 1;
 
-	fs_info = open_ctree_fs_info(argv[optind], 0, 0, 0,
-			OPEN_CTREE_CHUNK_ROOT_ONLY |
-			OPEN_CTREE_IGNORE_CHUNK_TREE_ERROR);
+	oca.filename = argv[optind];
+	oca.flags = OPEN_CTREE_CHUNK_ROOT_ONLY | OPEN_CTREE_IGNORE_CHUNK_TREE_ERROR;
+	fs_info = open_ctree_fs_info(&oca);
 	if (!fs_info) {
 		error("open ctree failed");
 		return 1;
@@ -395,7 +398,7 @@ int main(int argc, char **argv)
 	ret = btrfs_find_root_search(fs_info, &filter, &result, &found);
 	if (ret < 0) {
 		errno = -ret;
-		fprintf(stderr, "Fail to search the tree root: %m\n");
+		error("fail to search the tree root: %m");
 		goto out;
 	}
 	if (ret > 0) {

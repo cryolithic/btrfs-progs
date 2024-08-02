@@ -6,7 +6,7 @@
 # using btrfs_alloc_chunk() which won't use the 0~1M range, so other profiles
 # are safe, but we test them nevertheless.
 
-source "$TEST_TOP/common"
+source "$TEST_TOP/common" || exit
 
 check_prereq mkfs.btrfs
 check_prereq btrfs
@@ -15,6 +15,8 @@ prepare_test_dev
 
 do_one_test ()
 {
+	local first_dev_extent
+
 	run_check_mkfs_test_dev "$@"
 
 	# Use dev-extent tree to find first device extent

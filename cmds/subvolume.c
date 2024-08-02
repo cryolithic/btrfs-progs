@@ -14,61 +14,107 @@
  * Boston, MA 021110-1307, USA.
  */
 
+#include "kerncompat.h"
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/ioctl.h>
 #include <errno.h>
-#include <sys/stat.h>
-#include <sys/vfs.h>
-#include <libgen.h>
-#include <limits.h>
 #include <getopt.h>
+#include <dirent.h>
+#include <stdbool.h>
+#include <time.h>
 #include <uuid/uuid.h>
-#include <linux/magic.h>
-
-#include <btrfsutil.h>
-
-#include "kerncompat.h"
-#include "ioctl.h"
-#include "qgroup.h"
-
+#include "libbtrfsutil/btrfsutil.h"
+#include "kernel-shared/accessors.h"
+#include "kernel-shared/uapi/btrfs_tree.h"
+#include "kernel-shared/uapi/btrfs.h"
 #include "kernel-shared/ctree.h"
-#include "cmds/commands.h"
+#include "common/defs.h"
+#include "common/internal.h"
+#include "common/messages.h"
 #include "common/utils.h"
-#include "btrfs-list.h"
 #include "common/help.h"
 #include "common/path-utils.h"
 #include "common/device-scan.h"
+#include "common/open-utils.h"
+#include "common/string-utils.h"
+#include "common/units.h"
+#include "common/format-output.h"
+#include "common/tree-search.h"
+#include "cmds/commands.h"
+#include "cmds/qgroup.h"
+
+const struct rowspec btrfs_subvolume_rowspec[] = {
+	{ .key = "ID", .fmt = "%llu", .out_json = "id" },
+	{ .key = "name", .fmt = "str", .out_json = "name" },
+	{ .key = "gen", .fmt = "%llu", .out_json = "generation" },
+	{ .key = "cgen", .fmt = "%llu", .out_json = "cgeneration" },
+	{ .key = "parent", .fmt = "%llu", .out_json = "parent" },
+	{ .key = "top level", .fmt = "%llu", .out_json = "top_level" },
+	{ .key = "otime", .fmt = "date-time", .out_json = "otime" },
+	{ .key = "parent_uuid", .fmt = "uuid", .out_json = "parent_uuid" },
+	{ .key = "received_uuid", .fmt = "uuid", .out_json = "received_uuid" },
+	{ .key = "uuid", .fmt = "uuid", .out_json = "uuid" },
+	{ .key = "path", .fmt = "str", .out_json = "path" },
+	{ .key = "flag-list-item", .fmt = "%s" },
+	{ .key = "stransid", .fmt = "%llu", .out_json = "stransid" },
+	{ .key = "stime", .fmt = "date-time", .out_json = "stime" },
+	{ .key = "rtransid", .fmt = "%llu", .out_json = "rtransid" },
+	{ .key = "rtime", .fmt = "date-time", .out_json = "rtime" },
+	{ .key = "snapshot-list-item", .fmt = "str" },
+	{ .key = "quota-qgroup", .fmt = "qgroupid", .out_json = "qgroupid" },
+	{ .key = "quota-ref", .fmt = "%llu", .out_json = "referenced" },
+	{ .key = "quota-excl", .fmt = "%llu", .out_json = "exclusive" },
+	ROWSPEC_END
+};
 
 static int wait_for_subvolume_cleaning(int fd, size_t count, uint64_t *ids,
 				       int sleep_interval)
 {
 	size_t i;
 	enum btrfs_util_error err;
+	size_t done = 0;
+	bool statvfs_warned = false;
 
+	pr_verbose(LOG_DEFAULT, "Waiting for %zu subvolume%s\n", count,
+			(count > 1 ? "s" : ""));
 	while (1) {
-		int clean = 1;
+		struct statvfs st;
+		int ret;
+		bool clean = true;
 
 		for (i = 0; i < count; i++) {
 			if (!ids[i])
 				continue;
 			err = btrfs_util_subvolume_info_fd(fd, ids[i], NULL);
 			if (err == BTRFS_UTIL_ERROR_SUBVOLUME_NOT_FOUND) {
-				printf("Subvolume id %" PRIu64 " is gone\n",
-				       ids[i]);
+				done++;
+				pr_verbose(LOG_DEFAULT, "Subvolume id %" PRIu64 " is gone (%zu/%zu)\n",
+				       ids[i], done, count);
 				ids[i] = 0;
 			} else if (err) {
 				error_btrfs_util(err);
 				return -errno;
 			} else {
-				clean = 0;
+				clean = false;
 			}
 		}
 		if (clean)
 			break;
+
+		ret = fstatvfs(fd, &st);
+		if (ret < 0 && !statvfs_warned) {
+			statvfs_warned = true;
+			warning("cannot check read-only status of the filesystem: %m");
+		} else if (st.f_flag & ST_RDONLY) {
+			warning("filesystem is now read-only");
+			return 1;
+		}
 		sleep(sleep_interval);
 	}
 
@@ -80,132 +126,195 @@ static const char * const subvolume_cmd_group_usage[] = {
 	NULL
 };
 
-static const char * const cmd_subvol_create_usage[] = {
-	"btrfs subvolume create [-i <qgroupid>] [<dest>/]<name>",
-	"Create a subvolume",
-	"Create a subvolume <name> in <dest>.  If <dest> is not given",
-	"subvolume <name> will be created in the current directory.",
+static const char * const cmd_subvolume_create_usage[] = {
+	"btrfs subvolume create [options] [<dest>/]<name> [[<dest2>/]<name2> ...]",
+	"Create subvolume(s)",
+	"Create subvolume(s) at specified destination.  If <dest> is not given",
+	"subvolume <name> will be created in the current directory. Options apply",
+	"to all created subvolumes.",
 	"",
-	"-i <qgroupid>  add the newly created subvolume to a qgroup. This",
-	"               option can be given multiple times.",
+	OPTLINE("-i <qgroupid>", "add the newly created subvolume(s) to a qgroup. This option can be given multiple times."),
+	OPTLINE("-p|--parents", "create any missing parent directories for each argument (like mkdir -p)"),
 	HELPINFO_INSERT_GLOBALS,
 	HELPINFO_INSERT_QUIET,
 	NULL
 };
 
-static int cmd_subvol_create(const struct cmd_struct *cmd,
-			     int argc, char **argv)
+static int create_one_subvolume(const char *dst, struct btrfs_qgroup_inherit *inherit,
+				bool create_parents)
 {
-	int	retval, res, len;
+	int ret;
+	int len;
 	int	fddst = -1;
 	char	*dupname = NULL;
 	char	*dupdir = NULL;
-	char	*newname;
+	const char *newname;
 	char	*dstdir;
-	char	*dst;
-	struct btrfs_qgroup_inherit *inherit = NULL;
-	DIR	*dirstream = NULL;
 
-	optind = 0;
-	while (1) {
-		int c = getopt(argc, argv, "c:i:");
-		if (c < 0)
-			break;
-
-		switch (c) {
-		case 'c':
-			res = qgroup_inherit_add_copy(&inherit, optarg, 0);
-			if (res) {
-				retval = res;
-				goto out;
-			}
-			break;
-		case 'i':
-			res = qgroup_inherit_add_group(&inherit, optarg);
-			if (res) {
-				retval = res;
-				goto out;
-			}
-			break;
-		default:
-			usage_unknown_option(cmd, argv);
-		}
-	}
-
-	if (check_argc_exact(argc - optind, 1)) {
-		retval = 1;
-		goto out;
-	}
-
-	dst = argv[optind];
-
-	retval = 1;	/* failure */
-	res = path_is_dir(dst);
-	if (res < 0 && res != -ENOENT) {
-		errno = -res;
+	ret = path_is_dir(dst);
+	if (ret < 0 && ret != -ENOENT) {
+		errno = -ret;
 		error("cannot access %s: %m", dst);
 		goto out;
 	}
-	if (res >= 0) {
+	if (ret >= 0) {
 		error("target path already exists: %s", dst);
+		ret = -EEXIST;
 		goto out;
 	}
 
 	dupname = strdup(dst);
-	newname = basename(dupname);
+	if (!dupname) {
+		error_msg(ERROR_MSG_MEMORY, "duplicating %s", dst);
+		ret = -ENOMEM;
+		goto out;
+	}
+	newname = path_basename(dupname);
+
 	dupdir = strdup(dst);
-	dstdir = dirname(dupdir);
+	if (!dupdir) {
+		error_msg(ERROR_MSG_MEMORY, "duplicating %s", dst);
+		ret = -ENOMEM;
+		goto out;
+	}
+	dstdir = path_dirname(dupdir);
 
 	if (!test_issubvolname(newname)) {
 		error("invalid subvolume name: %s", newname);
+		ret = -EINVAL;
 		goto out;
 	}
 
 	len = strlen(newname);
 	if (len > BTRFS_VOL_NAME_MAX) {
 		error("subvolume name too long: %s", newname);
+		ret = -EINVAL;
 		goto out;
 	}
 
-	fddst = btrfs_open_dir(dstdir, &dirstream, 1);
-	if (fddst < 0)
-		goto out;
+	if (create_parents) {
+		char p[PATH_MAX] = { 0 };
+		char dstdir_dup[PATH_MAX];
+		char *token;
 
-	pr_verbose(MUST_LOG, "Create subvolume '%s/%s'\n", dstdir, newname);
+		strncpy_null(dstdir_dup, dstdir, sizeof(dstdir_dup));
+		if (dstdir_dup[0] == '/')
+			strcat(p, "/");
+
+		token = strtok(dstdir_dup, "/");
+		while (token) {
+			strcat(p, token);
+			ret = path_is_dir(p);
+			if (ret == -ENOENT) {
+				ret = mkdir(p, 0777);
+				if (ret < 0) {
+					error("failed to create directory %s: %m", p);
+					goto out;
+				}
+			} else if (ret <= 0) {
+				if (ret == 0)
+					ret = -EEXIST;
+				errno = ret ;
+				error("failed to check directory %s before creation: %m", p);
+				goto out;
+			}
+			strcat(p, "/");
+			token = strtok(NULL, "/");
+		}
+	}
+
+	fddst = btrfs_open_dir(dstdir);
+	if (fddst < 0) {
+		ret = fddst;
+		goto out;
+	}
+
 	if (inherit) {
 		struct btrfs_ioctl_vol_args_v2	args;
 
 		memset(&args, 0, sizeof(args));
-		strncpy_null(args.name, newname);
+		strncpy_null(args.name, newname, sizeof(args.name));
 		args.flags |= BTRFS_SUBVOL_QGROUP_INHERIT;
-		args.size = qgroup_inherit_size(inherit);
+		args.size = btrfs_qgroup_inherit_size(inherit);
 		args.qgroup_inherit = inherit;
 
-		res = ioctl(fddst, BTRFS_IOC_SUBVOL_CREATE_V2, &args);
+		ret = ioctl(fddst, BTRFS_IOC_SUBVOL_CREATE_V2, &args);
 	} else {
 		struct btrfs_ioctl_vol_args	args;
 
 		memset(&args, 0, sizeof(args));
-		strncpy_null(args.name, newname);
-
-		res = ioctl(fddst, BTRFS_IOC_SUBVOL_CREATE, &args);
+		strncpy_null(args.name, newname, sizeof(args.name));
+		ret = ioctl(fddst, BTRFS_IOC_SUBVOL_CREATE, &args);
 	}
 
-	if (res < 0) {
+	if (ret < 0) {
 		error("cannot create subvolume: %m");
 		goto out;
 	}
+	pr_verbose(LOG_DEFAULT, "Create subvolume '%s/%s'\n", dstdir, newname);
 
-	retval = 0;	/* success */
 out:
-	close_file_or_dir(fddst, dirstream);
-	free(inherit);
+	close(fddst);
 	free(dupname);
 	free(dupdir);
 
+	return ret;
+}
+static int cmd_subvolume_create(const struct cmd_struct *cmd, int argc, char **argv)
+{
+	int retval, ret;
+	struct btrfs_qgroup_inherit *inherit = NULL;
+	bool has_error = false;
+	bool create_parents = false;
+
+	optind = 0;
+	while (1) {
+		int c;
+		static const struct option long_options[] = {
+			{ "parents", no_argument, NULL, 'p' },
+			{ NULL, 0, NULL, 0 }
+		};
+
+		c = getopt_long(argc, argv, "i:p", long_options, NULL);
+		if (c < 0)
+			break;
+
+		switch (c) {
+		case 'i':
+			ret = btrfs_qgroup_inherit_add_group(&inherit, optarg);
+			if (ret) {
+				retval = ret;
+				goto out;
+			}
+			break;
+		case 'p':
+			create_parents = true;
+			break;
+		default:
+			usage_unknown_option(cmd, argv);
+		}
+	}
+
+	if (check_argc_min(argc - optind, 1)) {
+		retval = 1;
+		goto out;
+	}
+
+	retval = 1;
+
+	for (int i = optind; i < argc; i++) {
+		ret = create_one_subvolume(argv[i], inherit, create_parents);
+		if (ret < 0)
+			has_error = true;
+	}
+	if (!has_error)
+		retval = 0;
+out:
+	free(inherit);
+
 	return retval;
 }
-static DEFINE_SIMPLE_COMMAND(subvol_create, "create");
+static DEFINE_SIMPLE_COMMAND(subvolume_create, "create");
 
 static int wait_for_commit(int fd)
 {
@@ -223,7 +332,7 @@ static int wait_for_commit(int fd)
 	return 0;
 }
 
-static const char * const cmd_subvol_delete_usage[] = {
+static const char * const cmd_subvolume_delete_usage[] = {
 	"btrfs subvolume delete [options] <subvolume> [<subvolume>...]\n"
 	"btrfs subvolume delete [options] -i|--subvolid <subvolid> <path>",
 	"Delete subvolume(s)",
@@ -235,28 +344,29 @@ static const char * const cmd_subvol_delete_usage[] = {
 	"after a crash). Use one of the --commit options to wait until the",
 	"operation is safely stored on the media.",
 	"",
-	"-c|--commit-after      wait for transaction commit at the end of the operation",
-	"-C|--commit-each       wait for transaction commit after deleting each subvolume",
-	"-i|--subvolid          subvolume id of the to be removed subvolume",
-	"-v|--verbose           deprecated, alias for global -v option",
+	OPTLINE("-c|--commit-after", "wait for transaction commit at the end of the operation"),
+	OPTLINE("-C|--commit-each", "wait for transaction commit after deleting each subvolume"),
+	OPTLINE("-i|--subvolid", "subvolume id of the to be removed subvolume"),
+	OPTLINE("-v|--verbose", "deprecated, alias for global -v option"),
 	HELPINFO_INSERT_GLOBALS,
 	HELPINFO_INSERT_VERBOSE,
 	HELPINFO_INSERT_QUIET,
+	HELPINFO_INSERT_DRY_RUN,
 	NULL
 };
 
-static int cmd_subvol_delete(const struct cmd_struct *cmd,
-			     int argc, char **argv)
+static int cmd_subvolume_delete(const struct cmd_struct *cmd, int argc, char **argv)
 {
 	int res, ret = 0;
 	int cnt;
 	int fd = -1;
-	char	*dname, *vname, *cpath;
+	char	*dname, *cpath;
+	const char *vname;
 	char	*dupdname = NULL;
 	char	*dupvname = NULL;
 	char	*path = NULL;
-	DIR	*dirstream = NULL;
 	int commit_mode = 0;
+	bool subvol_path_not_found = false;
 	u8 fsid[BTRFS_FSID_SIZE];
 	u64 subvolid = 0;
 	char uuidbuf[BTRFS_UUID_UNPARSED_SIZE];
@@ -264,7 +374,7 @@ static int cmd_subvol_delete(const struct cmd_struct *cmd,
 	struct seen_fsid *seen_fsid_hash[SEEN_FSID_HASH_SIZE] = { NULL, };
 	enum { COMMIT_AFTER = 1, COMMIT_EACH = 2 };
 	enum btrfs_util_error err;
-	uint64_t default_subvol_id = 0, target_subvol_id = 0;
+	uint64_t default_subvol_id, target_subvol_id = 0;
 
 	optind = 0;
 	while (1) {
@@ -306,7 +416,7 @@ static int cmd_subvol_delete(const struct cmd_struct *cmd,
 	if (subvolid > 0 && check_argc_exact(argc - optind, 1))
 		return 1;
 
-	pr_verbose(1, "Transaction commit: %s\n",
+	pr_verbose(LOG_INFO, "Transaction commit: %s\n",
 		   !commit_mode ? "none (default)" :
 		   commit_mode == COMMIT_AFTER ? "at the end" : "after each");
 
@@ -318,6 +428,18 @@ static int cmd_subvol_delete(const struct cmd_struct *cmd,
 
 		path = argv[cnt];
 		err = btrfs_util_subvolume_path(path, subvolid, &subvol);
+		/*
+		 * If the subvolume is really not referred by anyone, and refs
+		 * is 0, newer kernel can handle it by just adding an orphan
+		 * item and queue it for cleanup.
+		 *
+		 * In this case, just let kernel to handle it, we do no extra
+		 * handling.
+		 */
+		if (err == BTRFS_UTIL_ERROR_SUBVOLUME_NOT_FOUND) {
+			subvol_path_not_found = true;
+			goto again;
+		}
 		if (err) {
 			error_btrfs_util(err);
 			ret = 1;
@@ -346,25 +468,26 @@ again:
 		goto out;
 	}
 	dupdname = strdup(cpath);
-	dname = dirname(dupdname);
+	dname = path_dirname(dupdname);
 	dupvname = strdup(cpath);
-	vname = basename(dupvname);
+	vname = path_basename(dupvname);
 	free(cpath);
 
 	/* When subvolid is passed, <path> will point to the mount point */
 	if (subvolid > 0)
 		dname = dupvname;
 
-	fd = btrfs_open_dir(dname, &dirstream, 1);
+	fd = btrfs_open_dir(dname);
 	if (fd < 0) {
 		ret = 1;
 		goto out;
 	}
 
+	default_subvol_id = 0;
 	err = btrfs_util_get_default_subvolume_fd(fd, &default_subvol_id);
-	if (err) {
-		warning("cannot read default subvolume id: %m");
-		default_subvol_id = 0;
+	if (err == BTRFS_UTIL_ERROR_SEARCH_FAILED) {
+		if (geteuid() != 0)
+			warning("cannot read default subvolume id: %m");
 	}
 
 	if (subvolid > 0) {
@@ -387,16 +510,23 @@ again:
 		goto out;
 	}
 
-	pr_verbose(MUST_LOG, "Delete subvolume (%s): ",
+	pr_verbose(LOG_DEFAULT, "Delete subvolume %" PRIu64 " (%s): ",
+		target_subvol_id,
 		commit_mode == COMMIT_EACH ||
 		(commit_mode == COMMIT_AFTER && cnt + 1 == argc) ?
 		"commit" : "no-commit");
 
 	if (subvolid == 0)
-		pr_verbose(MUST_LOG, "'%s/%s'\n", dname, vname);
+		pr_verbose(LOG_DEFAULT, "'%s/%s'\n", dname, vname);
+	else if (!subvol_path_not_found)
+		pr_verbose(LOG_DEFAULT, "'%s'\n", full_subvolpath);
 	else
-		pr_verbose(MUST_LOG, "'%s'\n", full_subvolpath);
+		pr_verbose(LOG_DEFAULT, "subvolid=%llu\n", subvolid);
 
+	if (bconf_is_dry_run())
+		goto out;
+
+	/* Start deleting. */
 	if (subvolid == 0)
 		err = btrfs_util_delete_subvolume_fd(fd, vname, 0);
 	else
@@ -406,7 +536,7 @@ again:
 
 		error_btrfs_util(err);
 		if (saved_errno == EPERM)
-			warning("deletion failed with EPERM, send may be in progress");
+			warning("deletion failed with EPERM, you don't have permissions or send may be in progress");
 		ret = 1;
 		goto out;
 	}
@@ -428,9 +558,9 @@ again:
 			goto out;
 		}
 
-		if (add_seen_fsid(fsid, seen_fsid_hash, fd, dirstream) == 0) {
+		if (add_seen_fsid(fsid, seen_fsid_hash, fd) == 0) {
 			uuid_unparse(fsid, uuidbuf);
-			pr_verbose(1, "  new fs is found for '%s', fsid: %s\n",
+			pr_verbose(LOG_INFO, "  new fs is found for '%s', fsid: %s\n",
 				   path, uuidbuf);
 			/*
 			 * This is the first time a subvolume on this
@@ -442,10 +572,9 @@ again:
 	}
 
 out:
-	close_file_or_dir(fd, dirstream);
+	close(fd);
 keep_fd:
 	fd = -1;
-	dirstream = NULL;
 	free(dupdname);
 	free(dupvname);
 	dupdname = NULL;
@@ -454,7 +583,7 @@ keep_fd:
 	if (cnt < argc)
 		goto again;
 
-	if (commit_mode == COMMIT_AFTER) {
+	if (commit_mode == COMMIT_AFTER && !bconf_is_dry_run()) {
 		int slot;
 
 		/*
@@ -474,7 +603,7 @@ keep_fd:
 					ret = 1;
 				} else {
 					uuid_unparse(seen->fsid, uuidbuf);
-					pr_verbose(1,
+					pr_verbose(LOG_INFO,
 					   "final sync is done for fsid: %s\n",
 						   uuidbuf);
 				}
@@ -487,273 +616,56 @@ keep_fd:
 
 	return ret;
 }
-static DEFINE_SIMPLE_COMMAND(subvol_delete, "delete");
+static DEFINE_COMMAND_WITH_FLAGS(subvolume_delete, "delete", CMD_DRY_RUN);
 
-/*
- * Naming of options:
- * - uppercase for filters and sort options
- * - lowercase for enabling specific items in the output
- */
-static const char * const cmd_subvol_list_usage[] = {
-	"btrfs subvolume list [options] <path>",
-	"List subvolumes and snapshots in the filesystem.",
+static const char * const cmd_subvolume_snapshot_usage[] = {
+	"btrfs subvolume snapshot [-r] [-i <qgroupid>] <subvolume> { <subdir>/<name> | <subdir> }",
 	"",
-	"Path filtering:",
-	"-o           print only subvolumes below specified path",
-	"-a           print all the subvolumes in the filesystem and",
-	"             distinguish absolute and relative path with respect",
-	"             to the given <path>",
+	"Create a snapshot of a <subvolume>. Call it <name> and place it in the <subdir>.",
+	"(<subvolume> will look like a new sub-directory, but is actually a btrfs subvolume",
+	"not a sub-directory.)",
 	"",
-	"Field selection:",
-	"-p           print parent ID",
-	"-c           print the ogeneration of the subvolume",
-	"-g           print the generation of the subvolume",
-	"-u           print the uuid of subvolumes (and snapshots)",
-	"-q           print the parent uuid of the snapshots",
-	"-R           print the uuid of the received snapshots",
+	"When only <subdir> is given, the subvolume will be named the basename of <subvolume>.",
 	"",
-	"Type filtering:",
-	"-s           list only snapshots",
-	"-r           list readonly subvolumes (including snapshots)",
-	"-d           list deleted subvolumes that are not yet cleaned",
-	"",
-	"Other:",
-	"-t           print the result as a table",
-	"",
-	"Sorting:",
-	"-G [+|-]value",
-	"             filter the subvolumes by generation",
-	"             (+value: >= value; -value: <= value; value: = value)",
-	"-C [+|-]value",
-	"             filter the subvolumes by ogeneration",
-	"             (+value: >= value; -value: <= value; value: = value)",
-	"--sort=gen,ogen,rootid,path",
-	"             list the subvolume in order of gen, ogen, rootid or path",
-	"             you also can add '+' or '-' in front of each items.",
-	"             (+:ascending, -:descending, ascending default)",
-	NULL,
-};
-
-static int cmd_subvol_list(const struct cmd_struct *cmd, int argc, char **argv)
-{
-	struct btrfs_list_filter_set *filter_set;
-	struct btrfs_list_comparer_set *comparer_set;
-	u64 flags = 0;
-	int fd = -1;
-	u64 top_id;
-	int ret = -1, uerr = 0;
-	char *subvol;
-	int is_list_all = 0;
-	int is_only_in_path = 0;
-	DIR *dirstream = NULL;
-	enum btrfs_list_layout layout = BTRFS_LIST_LAYOUT_DEFAULT;
-
-	filter_set = btrfs_list_alloc_filter_set();
-	comparer_set = btrfs_list_alloc_comparer_set();
-
-	optind = 0;
-	while(1) {
-		int c;
-		static const struct option long_options[] = {
-			{"sort", required_argument, NULL, 'S'},
-			{NULL, 0, NULL, 0}
-		};
-
-		c = getopt_long(argc, argv,
-				    "acdgopqsurRG:C:t", long_options, NULL);
-		if (c < 0)
-			break;
-
-		switch(c) {
-		case 'p':
-			btrfs_list_setup_print_column(BTRFS_LIST_PARENT);
-			break;
-		case 'a':
-			is_list_all = 1;
-			break;
-		case 'c':
-			btrfs_list_setup_print_column(BTRFS_LIST_OGENERATION);
-			break;
-		case 'd':
-			btrfs_list_setup_filter(&filter_set,
-						BTRFS_LIST_FILTER_DELETED,
-						0);
-			break;
-		case 'g':
-			btrfs_list_setup_print_column(BTRFS_LIST_GENERATION);
-			break;
-		case 'o':
-			is_only_in_path = 1;
-			break;
-		case 't':
-			layout = BTRFS_LIST_LAYOUT_TABLE;
-			break;
-		case 's':
-			btrfs_list_setup_filter(&filter_set,
-						BTRFS_LIST_FILTER_SNAPSHOT_ONLY,
-						0);
-			btrfs_list_setup_print_column(BTRFS_LIST_OGENERATION);
-			btrfs_list_setup_print_column(BTRFS_LIST_OTIME);
-			break;
-		case 'u':
-			btrfs_list_setup_print_column(BTRFS_LIST_UUID);
-			break;
-		case 'q':
-			btrfs_list_setup_print_column(BTRFS_LIST_PUUID);
-			break;
-		case 'R':
-			btrfs_list_setup_print_column(BTRFS_LIST_RUUID);
-			break;
-		case 'r':
-			flags |= BTRFS_ROOT_SUBVOL_RDONLY;
-			break;
-		case 'G':
-			btrfs_list_setup_print_column(BTRFS_LIST_GENERATION);
-			ret = btrfs_list_parse_filter_string(optarg,
-							&filter_set,
-							BTRFS_LIST_FILTER_GEN);
-			if (ret) {
-				uerr = 1;
-				goto out;
-			}
-			break;
-
-		case 'C':
-			btrfs_list_setup_print_column(BTRFS_LIST_OGENERATION);
-			ret = btrfs_list_parse_filter_string(optarg,
-							&filter_set,
-							BTRFS_LIST_FILTER_CGEN);
-			if (ret) {
-				uerr = 1;
-				goto out;
-			}
-			break;
-		case 'S':
-			ret = btrfs_list_parse_sort_string(optarg,
-							   &comparer_set);
-			if (ret) {
-				uerr = 1;
-				goto out;
-			}
-			break;
-
-		default:
-			uerr = 1;
-			goto out;
-		}
-	}
-
-	if (check_argc_exact(argc - optind, 1))
-		goto out;
-
-	subvol = argv[optind];
-	fd = btrfs_open_dir(subvol, &dirstream, 1);
-	if (fd < 0) {
-		ret = -1;
-		error("can't access '%s'", subvol);
-		goto out;
-	}
-
-	if (flags)
-		btrfs_list_setup_filter(&filter_set, BTRFS_LIST_FILTER_FLAGS,
-					flags);
-
-	ret = btrfs_list_get_path_rootid(fd, &top_id);
-	if (ret)
-		goto out;
-
-	if (is_list_all)
-		btrfs_list_setup_filter(&filter_set,
-					BTRFS_LIST_FILTER_FULL_PATH,
-					top_id);
-	else if (is_only_in_path)
-		btrfs_list_setup_filter(&filter_set,
-					BTRFS_LIST_FILTER_TOPID_EQUAL,
-					top_id);
-
-	/* by default we shall print the following columns*/
-	btrfs_list_setup_print_column(BTRFS_LIST_OBJECTID);
-	btrfs_list_setup_print_column(BTRFS_LIST_GENERATION);
-	btrfs_list_setup_print_column(BTRFS_LIST_TOP_LEVEL);
-	btrfs_list_setup_print_column(BTRFS_LIST_PATH);
-
-	ret = btrfs_list_subvols_print(fd, filter_set, comparer_set,
-			layout, !is_list_all && !is_only_in_path, NULL);
-
-out:
-	close_file_or_dir(fd, dirstream);
-	if (filter_set)
-		free(filter_set);
-	if (comparer_set)
-		free(comparer_set);
-	if (uerr)
-		usage(cmd);
-	return !!ret;
-}
-static DEFINE_SIMPLE_COMMAND(subvol_list, "list");
-
-static const char * const cmd_subvol_snapshot_usage[] = {
-	"btrfs subvolume snapshot [-r] [-i <qgroupid>] <source> <dest>|[<dest>/]<name>",
-	"Create a snapshot of the subvolume",
-	"Create a writable/readonly snapshot of the subvolume <source> with",
-	"the name <name> in the <dest> directory.  If only <dest> is given,",
-	"the subvolume will be named the basename of <source>.",
-	"",
-	"-r             create a readonly snapshot",
-	"-i <qgroupid>  add the newly created snapshot to a qgroup. This",
-	"               option can be given multiple times.",
+	OPTLINE("-r", "make the new snapshot readonly"),
+	OPTLINE("-i <qgroupid>", "Add the new snapshot to a qgroup (a quota group). This option can be given multiple times."),
 	HELPINFO_INSERT_GLOBALS,
 	HELPINFO_INSERT_QUIET,
 	NULL
 };
 
-static int cmd_subvol_snapshot(const struct cmd_struct *cmd,
-			       int argc, char **argv)
+static int cmd_subvolume_snapshot(const struct cmd_struct *cmd, int argc, char **argv)
 {
 	char	*subvol, *dst;
 	int	res, retval;
 	int	fd = -1, fddst = -1;
-	int	len, readonly = 0;
+	int	len;
+	bool readonly = false;
 	char	*dupname = NULL;
 	char	*dupdir = NULL;
-	char	*newname;
+	const char *newname;
 	char	*dstdir;
 	enum btrfs_util_error err;
 	struct btrfs_ioctl_vol_args_v2	args;
 	struct btrfs_qgroup_inherit *inherit = NULL;
-	DIR *dirstream1 = NULL, *dirstream2 = NULL;
 
 	memset(&args, 0, sizeof(args));
 	optind = 0;
 	while (1) {
-		int c = getopt(argc, argv, "c:i:r");
+		int c = getopt(argc, argv, "i:r");
 		if (c < 0)
 			break;
 
 		switch (c) {
-		case 'c':
-			res = qgroup_inherit_add_copy(&inherit, optarg, 0);
-			if (res) {
-				retval = res;
-				goto out;
-			}
-			break;
 		case 'i':
-			res = qgroup_inherit_add_group(&inherit, optarg);
+			res = btrfs_qgroup_inherit_add_group(&inherit, optarg);
 			if (res) {
 				retval = res;
 				goto out;
 			}
 			break;
 		case 'r':
-			readonly = 1;
-			break;
-		case 'x':
-			res = qgroup_inherit_add_copy(&inherit, optarg, 1);
-			if (res) {
-				retval = res;
-				goto out;
-			}
+			readonly = true;
 			break;
 		default:
 			usage_unknown_option(cmd, argv);
@@ -788,13 +700,13 @@ static int cmd_subvol_snapshot(const struct cmd_struct *cmd,
 
 	if (res > 0) {
 		dupname = strdup(subvol);
-		newname = basename(dupname);
+		newname = path_basename(dupname);
 		dstdir = dst;
 	} else {
 		dupname = strdup(dst);
-		newname = basename(dupname);
+		newname = path_basename(dupname);
 		dupdir = strdup(dst);
-		dstdir = dirname(dupdir);
+		dstdir = path_dirname(dupdir);
 	}
 
 	if (!test_issubvolname(newname)) {
@@ -808,68 +720,74 @@ static int cmd_subvol_snapshot(const struct cmd_struct *cmd,
 		goto out;
 	}
 
-	fddst = btrfs_open_dir(dstdir, &dirstream1, 1);
+	fddst = btrfs_open_dir(dstdir);
 	if (fddst < 0)
 		goto out;
 
-	fd = btrfs_open_dir(subvol, &dirstream2, 1);
+	fd = btrfs_open_dir(subvol);
 	if (fd < 0)
 		goto out;
 
-	if (readonly) {
+	if (readonly)
 		args.flags |= BTRFS_SUBVOL_RDONLY;
-		pr_verbose(MUST_LOG,
-			   "Create a readonly snapshot of '%s' in '%s/%s'\n",
-			   subvol, dstdir, newname);
-	} else {
-		pr_verbose(MUST_LOG,
-			   "Create a snapshot of '%s' in '%s/%s'\n",
-			   subvol, dstdir, newname);
-	}
 
 	args.fd = fd;
 	if (inherit) {
 		args.flags |= BTRFS_SUBVOL_QGROUP_INHERIT;
-		args.size = qgroup_inherit_size(inherit);
+		args.size = btrfs_qgroup_inherit_size(inherit);
 		args.qgroup_inherit = inherit;
 	}
-	strncpy_null(args.name, newname);
+	strncpy_null(args.name, newname, sizeof(args.name));
 
 	res = ioctl(fddst, BTRFS_IOC_SNAP_CREATE_V2, &args);
-
 	if (res < 0) {
-		error("cannot snapshot '%s': %m", subvol);
+		if (errno == ETXTBSY)
+			error("cannot snapshot '%s': source subvolume contains an active swapfile (%m)", subvol);
+		else
+			error("cannot snapshot '%s': %m", subvol);
 		goto out;
 	}
 
 	retval = 0;	/* success */
 
+	if (readonly)
+		pr_verbose(LOG_DEFAULT,
+			   "Create readonly snapshot of '%s' in '%s/%s'\n",
+			   subvol, dstdir, newname);
+	else
+		pr_verbose(LOG_DEFAULT,
+			   "Create snapshot of '%s' in '%s/%s'\n",
+			   subvol, dstdir, newname);
+
 out:
-	close_file_or_dir(fddst, dirstream1);
-	close_file_or_dir(fd, dirstream2);
+	close(fddst);
+	close(fd);
 	free(inherit);
 	free(dupname);
 	free(dupdir);
 
 	return retval;
 }
-static DEFINE_SIMPLE_COMMAND(subvol_snapshot, "snapshot");
+static DEFINE_SIMPLE_COMMAND(subvolume_snapshot, "snapshot");
 
-static const char * const cmd_subvol_get_default_usage[] = {
+static const char * const cmd_subvolume_get_default_usage[] = {
 	"btrfs subvolume get-default <path>",
 	"Get the default subvolume of a filesystem",
+#if EXPERIMENTAL
+	HELPINFO_INSERT_GLOBALS,
+	HELPINFO_INSERT_FORMAT,
+#endif
 	NULL
 };
 
-static int cmd_subvol_get_default(const struct cmd_struct *cmd,
-				  int argc, char **argv)
+static int cmd_subvolume_get_default(const struct cmd_struct *cmd, int argc, char **argv)
 {
 	int fd = -1;
 	int ret = 1;
 	uint64_t default_id;
-	DIR *dirstream = NULL;
 	enum btrfs_util_error err;
 	struct btrfs_util_subvolume_info subvol;
+	struct format_ctx fctx;
 	char *path;
 
 	clean_args_no_options(cmd, argc, argv);
@@ -877,7 +795,7 @@ static int cmd_subvol_get_default(const struct cmd_struct *cmd,
 	if (check_argc_exact(argc - optind, 1))
 		return 1;
 
-	fd = btrfs_open_dir(argv[1], &dirstream, 1);
+	fd = btrfs_open_dir(argv[1]);
 	if (fd < 0)
 		return 1;
 
@@ -889,7 +807,14 @@ static int cmd_subvol_get_default(const struct cmd_struct *cmd,
 
 	/* no need to resolve roots if FS_TREE is default */
 	if (default_id == BTRFS_FS_TREE_OBJECTID) {
-		printf("ID 5 (FS_TREE)\n");
+		if (bconf.output_format == CMD_FORMAT_JSON) {
+			fmt_start(&fctx, btrfs_subvolume_rowspec, 1, 0);
+			fmt_print(&fctx, "ID", 5);
+			fmt_end(&fctx);
+		} else {
+			pr_verbose(LOG_DEFAULT, "ID 5 (FS_TREE)\n");
+		}
+
 		ret = 0;
 		goto out;
 	}
@@ -906,19 +831,32 @@ static int cmd_subvol_get_default(const struct cmd_struct *cmd,
 		goto out;
 	}
 
-	printf("ID %" PRIu64 " gen %" PRIu64 " top level %" PRIu64 " path %s\n",
-	       subvol.id, subvol.generation, subvol.parent_id, path);
+	if (bconf.output_format == CMD_FORMAT_JSON) {
+		fmt_start(&fctx, btrfs_subvolume_rowspec, 1, 0);
+		fmt_print(&fctx, "ID", subvol.id);
+		fmt_print(&fctx, "gen", subvol.generation);
+		fmt_print(&fctx, "top level", subvol.parent_id);
+		fmt_print(&fctx, "path", path);
+		fmt_end(&fctx);
+	} else {
+		pr_verbose(LOG_DEFAULT, "ID %" PRIu64 " gen %" PRIu64 " top level %" PRIu64 " path %s\n",
+		       subvol.id, subvol.generation, subvol.parent_id, path);
+	}
 
 	free(path);
 
 	ret = 0;
 out:
-	close_file_or_dir(fd, dirstream);
+	close(fd);
 	return ret;
 }
-static DEFINE_SIMPLE_COMMAND(subvol_get_default, "get-default");
+#if EXPERIMENTAL
+static DEFINE_COMMAND_WITH_FLAGS(subvolume_get_default, "get-default", CMD_FORMAT_JSON);
+#else
+DEFINE_SIMPLE_COMMAND(subvolume_get_default, "get-default");
+#endif
 
-static const char * const cmd_subvol_set_default_usage[] = {
+static const char * const cmd_subvolume_set_default_usage[] = {
 	"btrfs subvolume set-default <subvolume>\n"
 	"btrfs subvolume set-default <subvolid> <path>",
 	"Set the default subvolume of the filesystem mounted as default.",
@@ -927,8 +865,7 @@ static const char * const cmd_subvol_set_default_usage[] = {
 	NULL
 };
 
-static int cmd_subvol_set_default(const struct cmd_struct *cmd,
-				  int argc, char **argv)
+static int cmd_subvolume_set_default(const struct cmd_struct *cmd, int argc, char **argv)
 {
 	u64 objectid;
 	char *path;
@@ -964,22 +901,426 @@ static int cmd_subvol_set_default(const struct cmd_struct *cmd,
 	}
 	return 0;
 }
-static DEFINE_SIMPLE_COMMAND(subvol_set_default, "set-default");
+static DEFINE_SIMPLE_COMMAND(subvolume_set_default, "set-default");
 
-static const char * const cmd_subvol_find_new_usage[] = {
+static const char * const cmd_subvolume_find_new_usage[] = {
 	"btrfs subvolume find-new <path> <lastgen>",
 	"List the recently modified files in a filesystem",
 	NULL
 };
 
-static int cmd_subvol_find_new(const struct cmd_struct *cmd,
-			       int argc, char **argv)
+/* finding the generation for a given path is a two step process.
+ * First we use the inode lookup routine to find out the root id
+ *
+ * Then we use the tree search ioctl to scan all the root items for a
+ * given root id and spit out the latest generation we can find
+ */
+static u64 find_root_gen(int fd)
+{
+	struct btrfs_ioctl_ino_lookup_args ino_args;
+	int ret;
+	struct btrfs_tree_search_args args;
+	struct btrfs_ioctl_search_key *sk;
+	unsigned long off = 0;
+	u64 max_found = 0;
+	int i;
+
+	memset(&ino_args, 0, sizeof(ino_args));
+	ino_args.objectid = BTRFS_FIRST_FREE_OBJECTID;
+
+	/* this ioctl fills in ino_args->treeid */
+	ret = ioctl(fd, BTRFS_IOC_INO_LOOKUP, &ino_args);
+	if (ret < 0) {
+		error("failed to lookup path for dirid %llu: %m", BTRFS_FIRST_FREE_OBJECTID);
+		return 0;
+	}
+
+	memset(&args, 0, sizeof(args));
+	sk = btrfs_tree_search_sk(&args);
+	sk->tree_id = BTRFS_ROOT_TREE_OBJECTID;
+
+	/*
+	 * there may be more than one ROOT_ITEM key if there are
+	 * snapshots pending deletion, we have to loop through
+	 * them.
+	 */
+	sk->min_objectid = ino_args.treeid;
+	sk->min_type = BTRFS_ROOT_ITEM_KEY;
+	sk->max_objectid = ino_args.treeid;
+	sk->max_type = BTRFS_ROOT_ITEM_KEY;
+	sk->max_offset = (u64)-1;
+	sk->max_transid = (u64)-1;
+	sk->nr_items = 4096;
+
+	while (1) {
+		ret = btrfs_tree_search_ioctl(fd, &args);
+		if (ret < 0) {
+			error("can't perform the search: %m");
+			return 0;
+		}
+		/* the ioctl returns the number of item it found in nr_items */
+		if (sk->nr_items == 0)
+			break;
+
+		off = 0;
+		for (i = 0; i < sk->nr_items; i++) {
+			struct btrfs_root_item *item;
+			struct btrfs_ioctl_search_header sh;
+
+			memcpy(&sh, btrfs_tree_search_data(&args, off), sizeof(sh));
+			off += sizeof(sh);
+			item = btrfs_tree_search_data(&args, off);
+			off += sh.len;
+
+			sk->min_objectid = sh.objectid;
+			sk->min_type = sh.type;
+			sk->min_offset = sh.offset;
+
+			if (sh.objectid > ino_args.treeid)
+				break;
+
+			if (sh.objectid == ino_args.treeid &&
+			    sh.type == BTRFS_ROOT_ITEM_KEY) {
+				max_found = max(max_found,
+						btrfs_root_generation(item));
+			}
+		}
+		if (sk->min_offset < (u64)-1)
+			sk->min_offset++;
+		else
+			break;
+
+		if (sk->min_type != BTRFS_ROOT_ITEM_KEY)
+			break;
+		if (sk->min_objectid != ino_args.treeid)
+			break;
+	}
+	return max_found;
+}
+
+/* pass in a directory id and this will return
+ * the full path of the parent directory inside its
+ * subvolume root.
+ *
+ * It may return NULL if it is in the root, or an ERR_PTR if things
+ * go badly.
+ */
+static char *__ino_resolve(int fd, u64 dirid)
+{
+	struct btrfs_ioctl_ino_lookup_args args;
+	int ret;
+	char *full;
+
+	memset(&args, 0, sizeof(args));
+	args.objectid = dirid;
+
+	ret = ioctl(fd, BTRFS_IOC_INO_LOOKUP, &args);
+	if (ret < 0) {
+		error("failed to lookup path for dirid %llu: %m", dirid);
+		return ERR_PTR(ret);
+	}
+
+	if (args.name[0]) {
+		/*
+		 * we're in a subdirectory of ref_tree, the kernel ioctl
+		 * puts a / in there for us
+		 */
+		full = strdup(args.name);
+		if (!full) {
+			error_msg(ERROR_MSG_MEMORY, NULL);
+			return ERR_PTR(-ENOMEM);
+		}
+	} else {
+		/* we're at the root of ref_tree */
+		full = NULL;
+	}
+	return full;
+}
+
+/*
+ * simple string builder, returning a new string with both
+ * dirid and name
+ */
+static char *build_name(const char *dirid, const char *name)
+{
+	char *full;
+
+	if (!dirid)
+		return strdup(name);
+
+	full = malloc(strlen(dirid) + strlen(name) + 1);
+	if (!full)
+		return NULL;
+	strcpy(full, dirid);
+	strcat(full, name);
+	return full;
+}
+
+/*
+ * given an inode number, this returns the full path name inside the subvolume
+ * to that file/directory.  cache_dirid and cache_name are used to
+ * cache the results so we can avoid tree searches if a later call goes
+ * to the same directory or file name
+ */
+static char *ino_resolve(int fd, u64 ino, u64 *cache_dirid, char **cache_name)
+
+{
+	u64 dirid;
+	char *dirname;
+	char *name;
+	char *full;
+	int ret;
+	struct btrfs_tree_search_args args;
+	struct btrfs_ioctl_search_key *sk;
+	struct btrfs_ioctl_search_header sh;
+	int namelen;
+
+	memset(&args, 0, sizeof(args));
+	sk = btrfs_tree_search_sk(&args);
+	sk->tree_id = 0;
+
+	/*
+	 * step one, we search for the inode back ref.  We just use the first
+	 * one
+	 */
+	sk->min_objectid = ino;
+	sk->max_objectid = ino;
+	sk->max_type = BTRFS_INODE_REF_KEY;
+	sk->max_offset = (u64)-1;
+	sk->min_type = BTRFS_INODE_REF_KEY;
+	sk->max_transid = (u64)-1;
+	sk->nr_items = 1;
+
+	ret = btrfs_tree_search_ioctl(fd, &args);
+	if (ret < 0) {
+		error("can't perform the search: %m");
+		return NULL;
+	}
+	/* the ioctl returns the number of item it found in nr_items */
+	if (sk->nr_items == 0)
+		return NULL;
+
+	memcpy(&sh, btrfs_tree_search_data(&args, 0), sizeof(sh));
+	if (sh.type == BTRFS_INODE_REF_KEY) {
+		struct btrfs_inode_ref *ref;
+
+		dirid = sh.offset;
+
+		ref = btrfs_tree_search_data(&args, sizeof(sh));
+		namelen = btrfs_stack_inode_ref_name_len(ref);
+
+		name = (char *)(ref + 1);
+		name = strndup(name, namelen);
+		if (!name) {
+			error_msg(ERROR_MSG_MEMORY, NULL);
+			return NULL;
+		}
+
+		/* use our cached value */
+		if (dirid == *cache_dirid && *cache_name) {
+			dirname = *cache_name;
+			goto build;
+		}
+	} else {
+		return NULL;
+	}
+	/*
+	 * the inode backref gives us the file name and the parent directory id.
+	 * From here we use __ino_resolve to get the path to the parent
+	 */
+	dirname = __ino_resolve(fd, dirid);
+build:
+	full = build_name(dirname, name);
+	if (*cache_name && dirname != *cache_name)
+		free(*cache_name);
+
+	*cache_name = dirname;
+	*cache_dirid = dirid;
+	free(name);
+
+	return full;
+}
+
+static int print_one_extent(int fd, struct btrfs_ioctl_search_header *sh,
+			    struct btrfs_file_extent_item *item,
+			    u64 found_gen, u64 *cache_dirid,
+			    char **cache_dir_name, u64 *cache_ino,
+			    char **cache_full_name)
+{
+	u64 len = 0;
+	u64 disk_start = 0;
+	u64 disk_offset = 0;
+	u8 type;
+	int compressed = 0;
+	int flags = 0;
+	char *name = NULL;
+
+	if (btrfs_search_header_objectid(sh) == *cache_ino) {
+		name = *cache_full_name;
+	} else if (*cache_full_name) {
+		free(*cache_full_name);
+		*cache_full_name = NULL;
+	}
+	if (!name) {
+		name = ino_resolve(fd, btrfs_search_header_objectid(sh),
+				   cache_dirid,
+				   cache_dir_name);
+		*cache_full_name = name;
+		*cache_ino = btrfs_search_header_objectid(sh);
+	}
+	if (!name)
+		return -EIO;
+
+	type = btrfs_stack_file_extent_type(item);
+	compressed = btrfs_stack_file_extent_compression(item);
+
+	if (type == BTRFS_FILE_EXTENT_REG ||
+	    type == BTRFS_FILE_EXTENT_PREALLOC) {
+		disk_start = btrfs_stack_file_extent_disk_bytenr(item);
+		disk_offset = btrfs_stack_file_extent_offset(item);
+		len = btrfs_stack_file_extent_num_bytes(item);
+	} else if (type == BTRFS_FILE_EXTENT_INLINE) {
+		disk_start = 0;
+		disk_offset = 0;
+		len = btrfs_stack_file_extent_ram_bytes(item);
+	} else {
+		error(
+	"unhandled extent type %d for inode %llu file offset %llu gen %llu",
+			type,
+			btrfs_search_header_objectid(sh),
+			btrfs_search_header_offset(sh),
+			found_gen);
+
+		return -EIO;
+	}
+	pr_verbose(LOG_DEFAULT, "inode %llu file offset %llu len %llu disk start %llu "
+	       "offset %llu gen %llu flags ",
+	       btrfs_search_header_objectid(sh), btrfs_search_header_offset(sh),
+	       len, disk_start, disk_offset, found_gen);
+
+	if (compressed) {
+		pr_verbose(LOG_DEFAULT, "COMPRESS");
+		flags++;
+	}
+	if (type == BTRFS_FILE_EXTENT_PREALLOC) {
+		pr_verbose(LOG_DEFAULT, "%sPREALLOC", flags ? "|" : "");
+		flags++;
+	}
+	if (type == BTRFS_FILE_EXTENT_INLINE) {
+		pr_verbose(LOG_DEFAULT, "%sINLINE", flags ? "|" : "");
+		flags++;
+	}
+	if (!flags)
+		pr_verbose(LOG_DEFAULT, "NONE");
+
+	pr_verbose(LOG_DEFAULT, " %s\n", name);
+	return 0;
+}
+
+static int btrfs_list_find_updated_files(int fd, u64 root_id, u64 oldest_gen)
+{
+	int ret;
+	struct btrfs_tree_search_args args;
+	struct btrfs_ioctl_search_key *sk;
+	struct btrfs_file_extent_item *item;
+	unsigned long off = 0;
+	u64 found_gen;
+	u64 max_found = 0;
+	int i;
+	u64 cache_dirid = 0;
+	u64 cache_ino = 0;
+	char *cache_dir_name = NULL;
+	char *cache_full_name = NULL;
+	struct btrfs_file_extent_item backup;
+
+	memset(&backup, 0, sizeof(backup));
+	memset(&args, 0, sizeof(args));
+	sk = btrfs_tree_search_sk(&args);
+	sk->tree_id = root_id;
+
+	/*
+	 * set all the other params to the max, we'll take any objectid
+	 * and any trans
+	 */
+	sk->max_objectid = (u64)-1;
+	sk->max_offset = (u64)-1;
+	sk->max_transid = (u64)-1;
+	sk->max_type = BTRFS_EXTENT_DATA_KEY;
+	sk->min_transid = oldest_gen;
+	/* just a big number, doesn't matter much */
+	sk->nr_items = 4096;
+
+	max_found = find_root_gen(fd);
+	while(1) {
+		ret = btrfs_tree_search_ioctl(fd, &args);
+		if (ret < 0) {
+			error("can't perform the search: %m");
+			break;
+		}
+		/* the ioctl returns the number of item it found in nr_items */
+		if (sk->nr_items == 0)
+			break;
+
+		off = 0;
+
+		/*
+		 * for each item, pull the key out of the header and then
+		 * read the root_ref item it contains
+		 */
+		for (i = 0; i < sk->nr_items; i++) {
+			struct btrfs_ioctl_search_header sh;
+
+			memcpy(&sh, btrfs_tree_search_data(&args, off), sizeof(sh));
+			off += sizeof(sh);
+
+			/*
+			 * just in case the item was too big, pass something other
+			 * than garbage
+			 */
+			if (sh.len == 0)
+				item = &backup;
+			else
+				item = btrfs_tree_search_data(&args, off);
+
+			found_gen = btrfs_stack_file_extent_generation(item);
+			if (sh.type == BTRFS_EXTENT_DATA_KEY &&
+			    found_gen >= oldest_gen) {
+				print_one_extent(fd, &sh, item, found_gen,
+						 &cache_dirid, &cache_dir_name,
+						 &cache_ino, &cache_full_name);
+			}
+			off += sh.len;
+
+			/*
+			 * record the mins in sk so we can make sure the
+			 * next search doesn't repeat this root
+			 */
+			sk->min_objectid = sh.objectid;
+			sk->min_type = sh.type;
+			sk->min_offset = sh.offset;
+		}
+		sk->nr_items = 4096;
+		if (sk->min_offset < (u64)-1)
+			sk->min_offset++;
+		else if (sk->min_objectid < (u64)-1) {
+			sk->min_objectid++;
+			sk->min_offset = 0;
+			sk->min_type = 0;
+		} else
+			break;
+	}
+	free(cache_dir_name);
+	free(cache_full_name);
+	pr_verbose(LOG_DEFAULT, "transid marker was %llu\n", max_found);
+	return ret;
+}
+
+static int cmd_subvolume_find_new(const struct cmd_struct *cmd, int argc, char **argv)
 {
 	int fd;
 	int ret;
 	char *subvol;
 	u64 last_gen;
-	DIR *dirstream = NULL;
 	enum btrfs_util_error err;
 
 	clean_args_no_options(cmd, argc, argv);
@@ -996,44 +1337,192 @@ static int cmd_subvol_find_new(const struct cmd_struct *cmd,
 		return 1;
 	}
 
-	fd = btrfs_open_dir(subvol, &dirstream, 1);
+	fd = btrfs_open_dir(subvol);
 	if (fd < 0)
 		return 1;
 
 	err = btrfs_util_sync_fd(fd);
 	if (err) {
 		error_btrfs_util(err);
-		close_file_or_dir(fd, dirstream);
+		close(fd);
 		return 1;
 	}
 
 	ret = btrfs_list_find_updated_files(fd, 0, last_gen);
-	close_file_or_dir(fd, dirstream);
+	close(fd);
 	return !!ret;
 }
-static DEFINE_SIMPLE_COMMAND(subvol_find_new, "find-new");
+static DEFINE_SIMPLE_COMMAND(subvolume_find_new, "find-new");
 
-static const char * const cmd_subvol_show_usage[] = {
+static void print_subvolume_show_text(const struct btrfs_util_subvolume_info *subvol,
+				      const char *subvol_path, const char *subvol_name)
+{
+	char tstr[256];
+	char uuidparse[BTRFS_UUID_UNPARSED_SIZE];
+
+	/* Warn if it's a read-write subvolume with received_uuid */
+	if (!uuid_is_null(subvol->received_uuid) &&
+	    !(subvol->flags & BTRFS_ROOT_SUBVOL_RDONLY)) {
+		warning("the subvolume is read-write and has received_uuid set,\n"
+			"\t don't use it for incremental send. Please see section\n"
+			"\t 'SUBVOLUME FLAGS' in manual page btrfs-subvolume for\n"
+			"\t further information.");
+	}
+
+	/* print the info */
+	pr_verbose(LOG_DEFAULT, "%s\n",
+		   subvol->id == BTRFS_FS_TREE_OBJECTID ? "/" : subvol_path);
+	pr_verbose(LOG_DEFAULT, "\tName: \t\t\t%s\n", subvol_name);
+
+	if (uuid_is_null(subvol->uuid))
+		strcpy(uuidparse, "-");
+	else
+		uuid_unparse(subvol->uuid, uuidparse);
+	pr_verbose(LOG_DEFAULT, "\tUUID: \t\t\t%s\n", uuidparse);
+
+	if (uuid_is_null(subvol->parent_uuid))
+		strcpy(uuidparse, "-");
+	else
+		uuid_unparse(subvol->parent_uuid, uuidparse);
+	pr_verbose(LOG_DEFAULT, "\tParent UUID: \t\t%s\n", uuidparse);
+
+	if (uuid_is_null(subvol->received_uuid))
+		strcpy(uuidparse, "-");
+	else
+		uuid_unparse(subvol->received_uuid, uuidparse);
+	pr_verbose(LOG_DEFAULT, "\tReceived UUID: \t\t%s\n", uuidparse);
+
+	if (subvol->otime.tv_sec) {
+		struct tm tm;
+
+		localtime_r(&subvol->otime.tv_sec, &tm);
+		strftime(tstr, 256, "%Y-%m-%d %X %z", &tm);
+	} else
+		strcpy(tstr, "-");
+	pr_verbose(LOG_DEFAULT, "\tCreation time: \t\t%s\n", tstr);
+
+	pr_verbose(LOG_DEFAULT, "\tSubvolume ID: \t\t%" PRIu64 "\n", subvol->id);
+	pr_verbose(LOG_DEFAULT, "\tGeneration: \t\t%" PRIu64 "\n", subvol->generation);
+	pr_verbose(LOG_DEFAULT, "\tGen at creation: \t%" PRIu64 "\n", subvol->otransid);
+	pr_verbose(LOG_DEFAULT, "\tParent ID: \t\t%" PRIu64 "\n", subvol->parent_id);
+	pr_verbose(LOG_DEFAULT, "\tTop level ID: \t\t%" PRIu64 "\n", subvol->parent_id);
+
+	if (subvol->flags & BTRFS_ROOT_SUBVOL_RDONLY)
+		pr_verbose(LOG_DEFAULT, "\tFlags: \t\t\treadonly\n");
+	else
+		pr_verbose(LOG_DEFAULT, "\tFlags: \t\t\t-\n");
+
+	pr_verbose(LOG_DEFAULT, "\tSend transid: \t\t%" PRIu64 "\n", subvol->stransid);
+	pr_verbose(LOG_DEFAULT, "\tSend time: \t\t%s\n", tstr);
+	if (subvol->stime.tv_sec) {
+		struct tm tm;
+
+		localtime_r(&subvol->stime.tv_sec, &tm);
+		strftime(tstr, 256, "%Y-%m-%d %X %z", &tm);
+	} else {
+		strcpy(tstr, "-");
+	}
+	pr_verbose(LOG_DEFAULT, "\tReceive transid: \t%" PRIu64 "\n", subvol->rtransid);
+	if (subvol->rtime.tv_sec) {
+		struct tm tm;
+
+		localtime_r(&subvol->rtime.tv_sec, &tm);
+		strftime(tstr, 256, "%Y-%m-%d %X %z", &tm);
+	} else {
+		strcpy(tstr, "-");
+	}
+	pr_verbose(LOG_DEFAULT, "\tReceive time: \t\t%s\n", tstr);
+}
+
+static void print_subvolume_show_quota_text(const struct btrfs_util_subvolume_info *subvol,
+					    const struct btrfs_qgroup_stats *stats,
+					    unsigned int unit_mode)
+{
+	pr_verbose(LOG_DEFAULT, "\tQuota group:\t\t0/%" PRIu64 "\n", subvol->id);
+	fflush(stdout);
+
+	pr_verbose(LOG_DEFAULT, "\t  Limit referenced:\t%s\n",
+			stats->limit.max_referenced == 0 ? "-" :
+			pretty_size_mode(stats->limit.max_referenced, unit_mode));
+	pr_verbose(LOG_DEFAULT, "\t  Limit exclusive:\t%s\n",
+			stats->limit.max_exclusive == 0 ? "-" :
+			pretty_size_mode(stats->limit.max_exclusive, unit_mode));
+	pr_verbose(LOG_DEFAULT, "\t  Usage referenced:\t%s\n",
+			pretty_size_mode(stats->info.referenced, unit_mode));
+	pr_verbose(LOG_DEFAULT, "\t  Usage exclusive:\t%s\n",
+			pretty_size_mode(stats->info.exclusive, unit_mode));
+}
+
+static void print_subvolume_show_json(struct format_ctx *fctx,
+				      const struct btrfs_util_subvolume_info *subvol,
+				      const char *subvol_path, const char *subvol_name)
+{
+	fmt_print(fctx, "name", subvol_name);
+
+	fmt_print(fctx, "uuid", subvol->uuid);
+	fmt_print(fctx, "parent_uuid", subvol->parent_uuid);
+	fmt_print(fctx, "received_uuid", subvol->received_uuid);
+	fmt_print(fctx, "otime", subvol->otime);
+	fmt_print(fctx, "ID", subvol->id);
+	fmt_print(fctx, "gen", subvol->generation);
+	fmt_print(fctx, "cgen", subvol->otransid);
+	fmt_print(fctx, "parent", subvol->parent_id);
+	fmt_print(fctx, "top level", subvol->parent_id);
+
+	fmt_print_start_group(fctx, "flags", JSON_TYPE_ARRAY);
+	if (subvol->flags & BTRFS_ROOT_SUBVOL_RDONLY)
+		fmt_print(fctx, "flag-list-item", "readonly");
+	fmt_print_end_group(fctx, "flags");
+
+	fmt_print(fctx, "stransid", subvol->stransid);
+	fmt_print(fctx, "stime", subvol->stime);
+	fmt_print(fctx, "rtransid", subvol->rtransid);
+	fmt_print(fctx, "rtime", subvol->rtime);
+}
+
+static void print_subvolume_show_quota_json(struct format_ctx *fctx,
+					     const struct btrfs_util_subvolume_info *subvol,
+					     const struct btrfs_qgroup_stats *stats)
+{
+	fmt_print_start_group(fctx, "qgroup", JSON_TYPE_MAP);
+	fmt_print(fctx, "quota-qgroup", 0, subvol->id);
+
+	fmt_print_start_group(fctx, "limit", JSON_TYPE_MAP);
+	fmt_print(fctx, "quota-ref", stats->limit.max_referenced);
+	fmt_print(fctx, "quota-excl", stats->limit.max_exclusive);
+	fmt_print_end_group(fctx, "limit");
+
+	fmt_print_start_group(fctx, "usage", JSON_TYPE_MAP);
+	fmt_print(fctx, "quota-ref", stats->info.referenced);
+	fmt_print(fctx, "quota-excl", stats->info.exclusive);
+	fmt_print_end_group(fctx, "usage");
+
+	fmt_print_end_group(fctx, "qgroup");
+}
+
+static const char * const cmd_subvolume_show_usage[] = {
 	"btrfs subvolume show [options] <path>",
 	"Show more information about the subvolume (UUIDs, generations, times, snapshots)",
 	"Show more information about the subvolume (UUIDs, generations, times, snapshots).",
 	"The subvolume can be specified by path, or by root id or UUID that are",
 	"looked up relative to the given path",
 	"",
-	"-r|--rootid ID       root id of the subvolume",
-	"-u|--uuid UUID       UUID of the subvolum",
+	OPTLINE("-r|--rootid ID", "root id of the subvolume"),
+	OPTLINE("-u|--uuid UUID", "UUID of the subvolum"),
 	HELPINFO_UNITS_SHORT_LONG,
+#if EXPERIMENTAL
+	HELPINFO_INSERT_GLOBALS,
+	HELPINFO_INSERT_FORMAT,
+#endif
 	NULL
 };
 
-static int cmd_subvol_show(const struct cmd_struct *cmd, int argc, char **argv)
+static int cmd_subvolume_show(const struct cmd_struct *cmd, int argc, char **argv)
 {
-	char tstr[256];
 	char uuidparse[BTRFS_UUID_UNPARSED_SIZE];
 	char *fullpath = NULL;
 	int fd = -1;
 	int ret = 1;
-	DIR *dirstream1 = NULL;
 	int by_rootid = 0;
 	int by_uuid = 0;
 	u64 rootid_arg = 0;
@@ -1041,9 +1530,11 @@ static int cmd_subvol_show(const struct cmd_struct *cmd, int argc, char **argv)
 	struct btrfs_util_subvolume_iterator *iter;
 	struct btrfs_util_subvolume_info subvol;
 	char *subvol_path = NULL;
+	const char *subvol_name = NULL;
 	enum btrfs_util_error err;
 	struct btrfs_qgroup_stats stats;
 	unsigned int unit_mode;
+	struct format_ctx fctx;
 
 	unit_mode = get_unit_mode_from_arg(&argc, argv, 1);
 
@@ -1080,7 +1571,7 @@ static int cmd_subvol_show(const struct cmd_struct *cmd, int argc, char **argv)
 	if (by_rootid && by_uuid) {
 		error(
 		"options --rootid and --uuid cannot be used at the same time");
-		usage(cmd);
+		usage(cmd, 1);
 	}
 
 	fullpath = realpath(argv[optind], NULL);
@@ -1089,9 +1580,9 @@ static int cmd_subvol_show(const struct cmd_struct *cmd, int argc, char **argv)
 		goto out;
 	}
 
-	fd = open_file_or_dir(fullpath, &dirstream1);
+	fd = btrfs_open_file_or_dir(fullpath);
 	if (fd < 0) {
-		error("can't access '%s'", fullpath);
+		ret = fd;
 		goto out;
 	}
 
@@ -1146,52 +1637,27 @@ static int cmd_subvol_show(const struct cmd_struct *cmd, int argc, char **argv)
 
 	}
 
-	/* print the info */
-	printf("%s\n", subvol.id == BTRFS_FS_TREE_OBJECTID ? "/" : subvol_path);
-	printf("\tName: \t\t\t%s\n",
-	       (subvol.id == BTRFS_FS_TREE_OBJECTID ? "<FS_TREE>" :
-		basename(subvol_path)));
+	if (subvol.id == BTRFS_FS_TREE_OBJECTID) {
+		free(subvol_path);
+		subvol_path = strdup("/");
+		subvol_name = "<FS_TREE>";
+	} else {
+		subvol_name = path_basename(subvol_path);
+	}
 
-	if (uuid_is_null(subvol.uuid))
-		strcpy(uuidparse, "-");
-	else
-		uuid_unparse(subvol.uuid, uuidparse);
-	printf("\tUUID: \t\t\t%s\n", uuidparse);
-
-	if (uuid_is_null(subvol.parent_uuid))
-		strcpy(uuidparse, "-");
-	else
-		uuid_unparse(subvol.parent_uuid, uuidparse);
-	printf("\tParent UUID: \t\t%s\n", uuidparse);
-
-	if (uuid_is_null(subvol.received_uuid))
-		strcpy(uuidparse, "-");
-	else
-		uuid_unparse(subvol.received_uuid, uuidparse);
-	printf("\tReceived UUID: \t\t%s\n", uuidparse);
-
-	if (subvol.otime.tv_sec) {
-		struct tm tm;
-
-		localtime_r(&subvol.otime.tv_sec, &tm);
-		strftime(tstr, 256, "%Y-%m-%d %X %z", &tm);
-	} else
-		strcpy(tstr, "-");
-	printf("\tCreation time: \t\t%s\n", tstr);
-
-	printf("\tSubvolume ID: \t\t%" PRIu64 "\n", subvol.id);
-	printf("\tGeneration: \t\t%" PRIu64 "\n", subvol.generation);
-	printf("\tGen at creation: \t%" PRIu64 "\n", subvol.otransid);
-	printf("\tParent ID: \t\t%" PRIu64 "\n", subvol.parent_id);
-	printf("\tTop level ID: \t\t%" PRIu64 "\n", subvol.parent_id);
-
-	if (subvol.flags & BTRFS_ROOT_SUBVOL_RDONLY)
-		printf("\tFlags: \t\t\treadonly\n");
-	else
-		printf("\tFlags: \t\t\t-\n");
+	if (bconf.output_format == CMD_FORMAT_JSON) {
+		fmt_start(&fctx, btrfs_subvolume_rowspec, 1, 0);
+		fmt_print_start_group(&fctx, subvol_path, JSON_TYPE_MAP);
+		print_subvolume_show_json(&fctx, &subvol, subvol_path, subvol_name);
+	} else {
+		print_subvolume_show_text(&subvol, subvol_path, subvol_name);
+	}
 
 	/* print the snapshots of the given subvol if any*/
-	printf("\tSnapshot(s):\n");
+	if (bconf.output_format == CMD_FORMAT_JSON)
+		fmt_print_start_group(&fctx, "snapshots", JSON_TYPE_ARRAY);
+	else
+		pr_verbose(LOG_DEFAULT, "\tSnapshot(s):\n");
 
 	err = btrfs_util_create_subvolume_iterator_fd(fd,
 						      BTRFS_FS_TREE_OBJECTID, 0,
@@ -1207,58 +1673,63 @@ static int cmd_subvol_show(const struct cmd_struct *cmd, int argc, char **argv)
 		} else if (err) {
 			error_btrfs_util(err);
 			btrfs_util_destroy_subvolume_iterator(iter);
-			goto out;
+			goto out2;
 		}
 
-		if (uuid_compare(subvol2.parent_uuid, subvol.uuid) == 0)
-			printf("\t\t\t\t%s\n", path);
+		if (uuid_compare(subvol2.parent_uuid, subvol.uuid) == 0) {
+			if (bconf.output_format == CMD_FORMAT_JSON)
+				fmt_print(&fctx, "snapshot-list-item", path);
+			else
+				pr_verbose(LOG_DEFAULT, "\t\t\t\t%s\n", path);
+		}
 
 		free(path);
 	}
+
+	if (bconf.output_format == CMD_FORMAT_JSON)
+		fmt_print_end_group(&fctx, "snapshots");
+
 	btrfs_util_destroy_subvolume_iterator(iter);
 
 	ret = btrfs_qgroup_query(fd, subvol.id, &stats);
 	if (ret == -ENOTTY) {
-		/* Quotas not enabled */
-		ret = 0;
-		goto out;
-	}
-	if (ret == -ENOTTY) {
 		/* Quota information not available, not fatal */
-		printf("\tQuota group:\t\tn/a\n");
+		if (bconf.output_format == CMD_FORMAT_TEXT)
+			pr_verbose(LOG_DEFAULT, "\tQuota group:\t\tn/a\n");
 		ret = 0;
-		goto out;
+		goto out2;
 	}
 
 	if (ret) {
-		fprintf(stderr, "ERROR: quota query failed: %m");
-		goto out;
+		error("quota query failed: %m");
+		goto out2;
 	}
 
-	printf("\tQuota group:\t\t0/%" PRIu64 "\n", subvol.id);
-	fflush(stdout);
+	if (bconf.output_format == CMD_FORMAT_JSON)
+		print_subvolume_show_quota_json(&fctx, &subvol, &stats);
+	else
+		print_subvolume_show_quota_text(&subvol, &stats, unit_mode);
 
-	printf("\t  Limit referenced:\t%s\n",
-			stats.limit.max_referenced == 0 ? "-" :
-			pretty_size_mode(stats.limit.max_referenced, unit_mode));
-	printf("\t  Limit exclusive:\t%s\n",
-			stats.limit.max_exclusive == 0 ? "-" :
-			pretty_size_mode(stats.limit.max_exclusive, unit_mode));
-	printf("\t  Usage referenced:\t%s\n",
-			pretty_size_mode(stats.info.referenced, unit_mode));
-	printf("\t  Usage exclusive:\t%s\n",
-			pretty_size_mode(stats.info.exclusive, unit_mode));
+out2:
+	if (bconf.output_format == CMD_FORMAT_JSON) {
+		fmt_print_end_group(&fctx, subvol_path);
+		fmt_end(&fctx);
+	}
 
 out:
 	free(subvol_path);
-	close_file_or_dir(fd, dirstream1);
+	close(fd);
 	free(fullpath);
 	return !!ret;
 }
-static DEFINE_SIMPLE_COMMAND(subvol_show, "show");
+#if EXPERIMENTAL
+static DEFINE_COMMAND_WITH_FLAGS(subvolume_show, "show", CMD_FORMAT_JSON);
+#else
+DEFINE_SIMPLE_COMMAND(subvolume_show, "show");
+#endif
 
-static const char * const cmd_subvol_sync_usage[] = {
-	"btrfs subvolume sync <path> [<subvol-id>...]",
+static const char * const cmd_subvolume_sync_usage[] = {
+	"btrfs subvolume sync <path> [<subvolid>...]",
 	"Wait until given subvolume(s) are completely removed from the filesystem.",
 	"Wait until given subvolume(s) are completely removed from the filesystem",
 	"after deletion.",
@@ -1266,15 +1737,14 @@ static const char * const cmd_subvol_sync_usage[] = {
 	"are completed, but do not wait for subvolumes deleted meanwhile.",
 	"The status of subvolume ids is checked periodically.",
 	"",
-	"-s <N>       sleep N seconds between checks (default: 1)",
+	OPTLINE("-s <N>", "sleep N seconds between checks (default: 1)"),
 	NULL
 };
 
-static int cmd_subvol_sync(const struct cmd_struct *cmd, int argc, char **argv)
+static int cmd_subvolume_sync(const struct cmd_struct *cmd, int argc, char **argv)
 {
 	int fd = -1;
 	int ret = 1;
-	DIR *dirstream = NULL;
 	uint64_t *ids = NULL;
 	size_t id_count, i;
 	int sleep_interval = 1;
@@ -1304,7 +1774,7 @@ static int cmd_subvol_sync(const struct cmd_struct *cmd, int argc, char **argv)
 	if (check_argc_min(argc - optind, 1))
 		return 1;
 
-	fd = btrfs_open_dir(argv[optind], &dirstream, 1);
+	fd = btrfs_open_dir(argv[optind]);
 	if (fd < 0) {
 		ret = 1;
 		goto out;
@@ -1326,7 +1796,7 @@ static int cmd_subvol_sync(const struct cmd_struct *cmd, int argc, char **argv)
 	} else {
 		ids = malloc(id_count * sizeof(uint64_t));
 		if (!ids) {
-			error("not enough memory");
+			error_msg(ERROR_MSG_MEMORY, NULL);
 			ret = 1;
 			goto out;
 		}
@@ -1357,26 +1827,26 @@ static int cmd_subvol_sync(const struct cmd_struct *cmd, int argc, char **argv)
 
 out:
 	free(ids);
-	close_file_or_dir(fd, dirstream);
+	close(fd);
 
 	return !!ret;
 }
-static DEFINE_SIMPLE_COMMAND(subvol_sync, "sync");
+static DEFINE_SIMPLE_COMMAND(subvolume_sync, "sync");
 
 static const char subvolume_cmd_group_info[] =
 "manage subvolumes: create, delete, list, etc";
 
 static const struct cmd_group subvolume_cmd_group = {
 	subvolume_cmd_group_usage, subvolume_cmd_group_info, {
-		&cmd_struct_subvol_create,
-		&cmd_struct_subvol_delete,
-		&cmd_struct_subvol_list,
-		&cmd_struct_subvol_snapshot,
-		&cmd_struct_subvol_get_default,
-		&cmd_struct_subvol_set_default,
-		&cmd_struct_subvol_find_new,
-		&cmd_struct_subvol_show,
-		&cmd_struct_subvol_sync,
+		&cmd_struct_subvolume_create,
+		&cmd_struct_subvolume_delete,
+		&cmd_struct_subvolume_list,
+		&cmd_struct_subvolume_snapshot,
+		&cmd_struct_subvolume_get_default,
+		&cmd_struct_subvolume_set_default,
+		&cmd_struct_subvolume_find_new,
+		&cmd_struct_subvolume_show,
+		&cmd_struct_subvolume_sync,
 		NULL
 	}
 };

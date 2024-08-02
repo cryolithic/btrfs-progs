@@ -17,30 +17,31 @@
  */
 
 #include "kerncompat.h"
-#include "androidcompat.h"
-
+#include <stdbool.h>
 #include <stdio.h>
-#include <stdio_ext.h>
 #include <stdlib.h>
-#include <sys/types.h>
-#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <uuid/uuid.h>
 #include <pthread.h>
-
+#include <errno.h>
+#include <stddef.h>
+#include <string.h>
 #include "kernel-lib/list.h"
-#include "kernel-lib/radix-tree.h"
+#include "kernel-shared/accessors.h"
+#include "kernel-shared/extent-io-tree.h"
+#include "kernel-shared/locking.h"
+#include "kernel-shared/uapi/btrfs_tree.h"
 #include "kernel-shared/ctree.h"
-#include "common/extent-cache.h"
 #include "kernel-shared/disk-io.h"
 #include "kernel-shared/volumes.h"
 #include "kernel-shared/transaction.h"
-#include "crypto/crc32c.h"
+#include "kernel-shared/extent_io.h"
+#include "common/internal.h"
+#include "common/messages.h"
+#include "common/extent-cache.h"
 #include "common/utils.h"
-#include "check/common.h"
-#include "cmds/commands.h"
 #include "cmds/rescue.h"
+#include "check/common.h"
 
 struct recover_control {
 	int verbose;
@@ -89,15 +90,14 @@ static struct extent_record *btrfs_new_extent_record(struct extent_buffer *eb)
 
 	rec = calloc(1, sizeof(*rec));
 	if (!rec) {
-		fprintf(stderr, "Fail to allocate memory for extent record.\n");
+		error_msg(ERROR_MSG_MEMORY, "extent record");
 		exit(1);
 	}
 
 	rec->cache.start = btrfs_header_bytenr(eb);
 	rec->cache.size = eb->len;
 	rec->generation = btrfs_header_generation(eb);
-	read_extent_buffer(eb, rec->csum, (unsigned long)btrfs_header_csum(eb),
-			   BTRFS_CSUM_SIZE);
+	read_extent_buffer(eb, rec->csum, 0, BTRFS_CSUM_SIZE);
 	return rec;
 }
 
@@ -144,7 +144,11 @@ again:
 	rec->offsets[0] = offset;
 	rec->nmirrors++;
 	ret = insert_cache_extent(eb_cache, &rec->cache);
-	BUG_ON(ret);
+	if (ret < 0) {
+		errno = -ret;
+		error("cannot insert extent to cache start %llu size %llu: %m",
+		      rec->cache.start, rec->cache.size);
+	}
 out:
 	return ret;
 free_out:
@@ -269,7 +273,11 @@ again:
 	}
 
 	ret = insert_block_group_record(bg_cache, rec);
-	BUG_ON(ret);
+	if (ret < 0) {
+		errno = -ret;
+		error("cannot insert qgroup record %llu: %m", rec->cache.start);
+		goto free_out;
+	}
 out:
 	return ret;
 free_out:
@@ -313,7 +321,11 @@ again:
 		goto again;
 	}
 	ret = insert_cache_extent(chunk_cache, &rec->cache);
-	BUG_ON(ret);
+	if (ret < 0) {
+		errno = -ret;
+		error("cannot insert extent to cache start %llu size %llu: %m",
+		      rec->cache.start, rec->cache.size);
+	}
 out:
 	return ret;
 free_out:
@@ -359,7 +371,11 @@ again:
 	}
 
 	ret = insert_device_extent_record(devext_cache, rec);
-	BUG_ON(ret);
+	if (ret < 0) {
+		errno = -ret;
+		error("cannot insert device extent record to cache start %llu size %llu: %m",
+		      rec->cache.start, rec->cache.size);
+	}
 out:
 	return ret;
 free_out:
@@ -556,18 +572,17 @@ static int check_chunk_by_metadata(struct recover_control *rc,
 				   struct btrfs_root *root,
 				   struct chunk_record *chunk, int bg_only)
 {
+	struct btrfs_fs_info *fs_info = root->fs_info;
 	int ret;
 	int i;
 	int slot;
-	struct btrfs_path path;
+	struct btrfs_path path = { 0 };
 	struct btrfs_key key;
 	struct btrfs_root *dev_root;
 	struct stripe *stripe;
 	struct btrfs_dev_extent *dev_extent;
 	struct btrfs_block_group_item *bg_ptr;
 	struct extent_buffer *l;
-
-	btrfs_init_path(&path);
 
 	if (bg_only)
 		goto bg_check;
@@ -577,8 +592,8 @@ static int check_chunk_by_metadata(struct recover_control *rc,
 		stripe = &chunk->stripes[i];
 
 		key.objectid = stripe->devid;
-		key.offset = stripe->offset;
 		key.type = BTRFS_DEV_EXTENT_KEY;
+		key.offset = stripe->offset;
 
 		ret = btrfs_search_slot(NULL, dev_root, &key, &path, 0, 0);
 		if (ret < 0) {
@@ -617,7 +632,8 @@ bg_check:
 	key.type = BTRFS_BLOCK_GROUP_ITEM_KEY;
 	key.offset = chunk->length;
 
-	ret = btrfs_search_slot(NULL, root->fs_info->extent_root, &key, &path,
+	root = btrfs_extent_root(fs_info, key.objectid);
+	ret = btrfs_search_slot(NULL, root, &key, &path,
 				0, 0);
 	if (ret < 0) {
 		fprintf(stderr, "Search block group failed(%d)\n", ret);
@@ -756,7 +772,7 @@ static int scan_one_device(void *dev_scan_struct)
 		if (is_super_block_address(bytenr))
 			bytenr += rc->sectorsize;
 
-		if (pread64(fd, buf->data, rc->nodesize, bytenr) <
+		if (pread(fd, buf->data, rc->nodesize, bytenr) <
 		    rc->nodesize)
 			break;
 
@@ -821,7 +837,7 @@ static int scan_devices(struct recover_control *rc)
 	int devnr = 0;
 	int devidx = 0;
 	int i;
-	int all_done;
+	bool all_done;
 
 	list_for_each_entry(dev, &rc->fs_devices->devices, dev_list)
 		devnr++;
@@ -867,14 +883,14 @@ static int scan_devices(struct recover_control *rc)
 	}
 
 	while (1) {
-		all_done = 1;
+		all_done = true;
 		for (i = 0; i < devidx; i++) {
 			if (dev_scans[i].bytenr == -1)
 				continue;
 			ret = pthread_tryjoin_np(t_scans[i],
 						 (void **)&t_rets[i]);
 			if (ret == EBUSY) {
-				all_done = 0;
+				all_done = false;
 				continue;
 			}
 			if (ret || t_rets[i]) {
@@ -987,7 +1003,7 @@ static int block_group_remove_all_extent_items(struct btrfs_trans_handle *trans,
 {
 	struct btrfs_fs_info *fs_info = root->fs_info;
 	struct btrfs_key key;
-	struct btrfs_path path;
+	struct btrfs_path path = { 0 };
 	struct extent_buffer *leaf;
 	u64 start = bg->objectid;
 	u64 end = bg->objectid + bg->offset;
@@ -997,12 +1013,11 @@ static int block_group_remove_all_extent_items(struct btrfs_trans_handle *trans,
 	int i;
 	int del_s, del_nr;
 
-	btrfs_init_path(&path);
-	root = root->fs_info->extent_root;
+	root = btrfs_extent_root(fs_info, start);
 
 	key.objectid = start;
-	key.offset = 0;
 	key.type = BTRFS_EXTENT_ITEM_KEY;
+	key.offset = 0;
 again:
 	ret = btrfs_search_slot(trans, root, &key, &path, -1, 1);
 	if (ret < 0)
@@ -1101,7 +1116,7 @@ static int block_group_free_all_extent(struct btrfs_trans_handle *trans,
 
 	if (list_empty(&cache->dirty_list))
 		list_add_tail(&cache->dirty_list, &trans->dirty_bgs);
-	set_extent_dirty(&info->free_space_cache, start, end);
+	set_extent_dirty(&info->free_space_cache, start, end, GFP_NOFS);
 
 	cache->used = 0;
 
@@ -1148,9 +1163,8 @@ static int __rebuild_chunk_root(struct btrfs_trans_handle *trans,
 	btrfs_set_disk_key_type(&disk_key, BTRFS_DEV_ITEM_KEY);
 	btrfs_set_disk_key_offset(&disk_key, min_devid);
 
-	cow = btrfs_alloc_free_block(trans, root, root->fs_info->nodesize,
-				     BTRFS_CHUNK_TREE_OBJECTID,
-				     &disk_key, 0, 0, 0);
+	cow = btrfs_alloc_tree_block(trans, root, 0, BTRFS_CHUNK_TREE_OBJECTID,
+				     &disk_key, 0, 0, 0, BTRFS_NESTING_NORMAL);
 	btrfs_set_header_bytenr(cow, cow->start);
 	btrfs_set_header_generation(cow, trans->transid);
 	btrfs_set_header_nritems(cow, 0);
@@ -1383,26 +1397,25 @@ static int rebuild_block_group(struct btrfs_trans_handle *trans,
 			       struct recover_control *rc,
 			       struct btrfs_root *root)
 {
+	struct btrfs_fs_info *fs_info = root->fs_info;
 	struct chunk_record *chunk_rec;
 	struct btrfs_key search_key;
-	struct btrfs_path path;
+	struct btrfs_path path = { 0 };
 	u64 used = 0;
 	int ret = 0;
 
 	if (list_empty(&rc->rebuild_chunks))
 		return 0;
 
-	btrfs_init_path(&path);
 	list_for_each_entry(chunk_rec, &rc->rebuild_chunks, list) {
 		search_key.objectid = chunk_rec->offset;
 		search_key.type = BTRFS_EXTENT_ITEM_KEY;
 		search_key.offset = 0;
-		ret = btrfs_search_slot(NULL, root->fs_info->extent_root,
-					&search_key, &path, 0, 0);
+		root = btrfs_extent_root(fs_info, chunk_rec->offset);
+		ret = btrfs_search_slot(NULL, root, &search_key, &path, 0, 0);
 		if (ret < 0)
 			goto out;
-		ret = calculate_bg_used(root->fs_info->extent_root,
-					chunk_rec, &path, &used);
+		ret = calculate_bg_used(root, chunk_rec, &path, &used);
 		/*
 		 * Extent tree is damaged, better to rebuild the whole extent
 		 * tree. Currently, change the used to chunk's len to prevent
@@ -1418,9 +1431,7 @@ static int rebuild_block_group(struct btrfs_trans_handle *trans,
 			used = chunk_rec->length;
 		}
 		btrfs_release_path(&path);
-		ret = __insert_block_group(trans, chunk_rec,
-					   root->fs_info->extent_root,
-					   used);
+		ret = __insert_block_group(trans, chunk_rec, root, used);
 		if (ret < 0)
 			goto out;
 	}
@@ -1440,13 +1451,13 @@ open_ctree_with_broken_chunk(struct recover_control *rc)
 
 	fs_info = btrfs_new_fs_info(1, BTRFS_SUPER_INFO_OFFSET);
 	if (!fs_info) {
-		fprintf(stderr, "Failed to allocate memory for fs_info\n");
+		error_msg(ERROR_MSG_MEMORY, "fs_info");
 		return ERR_PTR(-ENOMEM);
 	}
 	fs_info->is_chunk_recover = 1;
 
 	fs_info->fs_devices = rc->fs_devices;
-	ret = btrfs_open_devices(fs_info->fs_devices, O_RDWR);
+	ret = btrfs_open_devices(fs_info, fs_info->fs_devices, O_RDWR);
 	if (ret)
 		goto out;
 
@@ -1459,7 +1470,7 @@ open_ctree_with_broken_chunk(struct recover_control *rc)
 		goto out_devices;
 	}
 
-	ASSERT(!memcmp(disk_super->fsid, rc->fs_devices->fsid, BTRFS_FSID_SIZE));
+	UASSERT(!memcmp(disk_super->fsid, rc->fs_devices->fsid, BTRFS_FSID_SIZE));
 	fs_info->sectorsize = btrfs_super_sectorsize(disk_super);
 	fs_info->nodesize = btrfs_super_nodesize(disk_super);
 	fs_info->stripesize = btrfs_super_stripesize(disk_super);
@@ -1471,7 +1482,7 @@ open_ctree_with_broken_chunk(struct recover_control *rc)
 	features = btrfs_super_incompat_flags(disk_super);
 
 	if (features & BTRFS_FEATURE_INCOMPAT_METADATA_UUID)
-		ASSERT(!memcmp(disk_super->metadata_uuid,
+		UASSERT(!memcmp(disk_super->metadata_uuid,
 			       fs_info->fs_devices->metadata_uuid,
 			       BTRFS_FSID_SIZE));
 
@@ -1507,8 +1518,7 @@ static int recover_prepare(struct recover_control *rc, const char *path)
 {
 	int ret;
 	int fd;
-	struct btrfs_super_block *sb;
-	char buf[BTRFS_SUPER_INFO_SIZE];
+	struct btrfs_super_block sb;
 	struct btrfs_fs_devices *fs_devices;
 
 	ret = 0;
@@ -1518,23 +1528,22 @@ static int recover_prepare(struct recover_control *rc, const char *path)
 		return -1;
 	}
 
-	sb = (struct btrfs_super_block*)buf;
-	ret = btrfs_read_dev_super(fd, sb, BTRFS_SUPER_INFO_OFFSET,
+	ret = btrfs_read_dev_super(fd, &sb, BTRFS_SUPER_INFO_OFFSET,
 			SBREAD_RECOVER);
 	if (ret) {
 		fprintf(stderr, "read super block error\n");
 		goto out_close_fd;
 	}
 
-	rc->sectorsize = btrfs_super_sectorsize(sb);
-	rc->nodesize = btrfs_super_nodesize(sb);
-	rc->generation = btrfs_super_generation(sb);
-	rc->chunk_root_generation = btrfs_super_chunk_root_generation(sb);
-	rc->csum_size = btrfs_super_csum_size(sb);
-	rc->csum_type = btrfs_super_csum_type(sb);
+	rc->sectorsize = btrfs_super_sectorsize(&sb);
+	rc->nodesize = btrfs_super_nodesize(&sb);
+	rc->generation = btrfs_super_generation(&sb);
+	rc->chunk_root_generation = btrfs_super_chunk_root_generation(&sb);
+	rc->csum_size = btrfs_super_csum_size(&sb);
+	rc->csum_type = btrfs_super_csum_type(&sb);
 
 	/* if seed, the result of scanning below will be partial */
-	if (btrfs_super_flags(sb) & BTRFS_SUPER_FLAG_SEEDING) {
+	if (btrfs_super_flags(&sb) & BTRFS_SUPER_FLAG_SEEDING) {
 		fprintf(stderr, "this device is seed device\n");
 		ret = -1;
 		goto out_close_fd;
@@ -1573,10 +1582,7 @@ static int btrfs_get_device_extents(u64 chunk_object,
 
 static int calc_num_stripes(u64 type)
 {
-	if (type & (BTRFS_BLOCK_GROUP_RAID0 |
-		    BTRFS_BLOCK_GROUP_RAID10 |
-		    BTRFS_BLOCK_GROUP_RAID5 |
-		    BTRFS_BLOCK_GROUP_RAID6))
+	if (btrfs_bg_type_is_stripey(type))
 		return 0;
 	else if (type & (BTRFS_BLOCK_GROUP_RAID1 |
 			 BTRFS_BLOCK_GROUP_DUP))
@@ -1585,14 +1591,6 @@ static int calc_num_stripes(u64 type)
 		return 3;
 	else if (type & (BTRFS_BLOCK_GROUP_RAID1C4))
 		return 4;
-	else
-		return 1;
-}
-
-static inline int calc_sub_nstripes(u64 type)
-{
-	if (type & BTRFS_BLOCK_GROUP_RAID10)
-		return 2;
 	else
 		return 1;
 }
@@ -1659,13 +1657,11 @@ static int btrfs_calc_stripe_index(struct chunk_record *chunk, u64 logical)
 	} else if (chunk->type_flags & BTRFS_BLOCK_GROUP_RAID10) {
 		index = stripe_nr % (chunk->num_stripes / chunk->sub_stripes);
 		index *= chunk->sub_stripes;
-	} else if (chunk->type_flags & BTRFS_BLOCK_GROUP_RAID5) {
-		nr_data_stripes = chunk->num_stripes - 1;
-		index = stripe_nr % nr_data_stripes;
-		stripe_nr /= nr_data_stripes;
-		index = (index + stripe_nr) % chunk->num_stripes;
-	} else if (chunk->type_flags & BTRFS_BLOCK_GROUP_RAID6) {
-		nr_data_stripes = chunk->num_stripes - 2;
+	} else if (chunk->type_flags & BTRFS_BLOCK_GROUP_RAID56_MASK) {
+		int parity;
+
+		parity = btrfs_bg_type_to_nparity(chunk->type_flags);
+		nr_data_stripes = chunk->num_stripes - parity;
 		index = stripe_nr % nr_data_stripes;
 		stripe_nr /= nr_data_stripes;
 		index = (index + stripe_nr) % chunk->num_stripes;
@@ -1759,8 +1755,7 @@ no_extent_record:
 	if (list_empty(&devexts))
 		return 0;
 
-	if (chunk->type_flags & (BTRFS_BLOCK_GROUP_RAID5 |
-				 BTRFS_BLOCK_GROUP_RAID6)) {
+	if (chunk->type_flags & BTRFS_BLOCK_GROUP_RAID56_MASK) {
 		/* Fixme: try to recover the order by the parity block. */
 		list_splice_tail(&devexts, &chunk->dextents);
 		return -EINVAL;
@@ -1794,11 +1789,6 @@ no_extent_record:
 	return 0;
 }
 
-#define BTRFS_ORDERED_RAID	(BTRFS_BLOCK_GROUP_RAID0 |	\
-				 BTRFS_BLOCK_GROUP_RAID10 |	\
-				 BTRFS_BLOCK_GROUP_RAID5 |	\
-				 BTRFS_BLOCK_GROUP_RAID6)
-
 static int btrfs_rebuild_chunk_stripes(struct recover_control *rc,
 				       struct chunk_record *chunk)
 {
@@ -1810,10 +1800,10 @@ static int btrfs_rebuild_chunk_stripes(struct recover_control *rc,
 	 * is we can reorder the stripes in the system metadata chunk.
 	 */
 	if ((chunk->type_flags & BTRFS_BLOCK_GROUP_METADATA) &&
-	    (chunk->type_flags & BTRFS_ORDERED_RAID))
+	    btrfs_bg_type_is_stripey(chunk->type_flags))
 		ret =btrfs_rebuild_ordered_meta_chunk_stripes(rc, chunk);
 	else if ((chunk->type_flags & BTRFS_BLOCK_GROUP_DATA) &&
-		 (chunk->type_flags & BTRFS_ORDERED_RAID))
+		 btrfs_bg_type_is_stripey(chunk->type_flags))
 		ret = 1;	/* Be handled after the fs is opened. */
 	else
 		ret = btrfs_rebuild_unordered_chunk_stripes(rc, chunk);
@@ -1821,7 +1811,7 @@ static int btrfs_rebuild_chunk_stripes(struct recover_control *rc,
 	return ret;
 }
 
-static int next_csum(struct btrfs_root *root,
+static int next_csum(struct btrfs_root *csum_root,
 		     struct extent_buffer **leaf,
 		     struct btrfs_path *path,
 		     int *slot,
@@ -1831,11 +1821,10 @@ static int next_csum(struct btrfs_root *root,
 		     struct btrfs_key *key)
 {
 	int ret = 0;
-	struct btrfs_root *csum_root = root->fs_info->csum_root;
 	struct btrfs_csum_item *csum_item;
-	u32 blocksize = root->fs_info->sectorsize;
-	u16 csum_size = btrfs_super_csum_size(root->fs_info->super_copy);
-	int csums_in_item = btrfs_item_size_nr(*leaf, *slot) / csum_size;
+	u32 blocksize = csum_root->fs_info->sectorsize;
+	u16 csum_size = csum_root->fs_info->csum_size;
+	int csums_in_item = btrfs_item_size(*leaf, *slot) / csum_size;
 
 	if (*csum_offset >= csums_in_item) {
 		++(*slot);
@@ -1876,11 +1865,7 @@ static u64 calc_data_offset(struct btrfs_key *key,
 	data_offset = key->offset + csum_offset * blocksize - chunk->offset;
 	nr_data_stripes = chunk->num_stripes;
 
-	if (chunk->type_flags & BTRFS_BLOCK_GROUP_RAID5)
-		nr_data_stripes -= 1;
-	else if (chunk->type_flags & BTRFS_BLOCK_GROUP_RAID6)
-		nr_data_stripes -= 2;
-
+	nr_data_stripes -= btrfs_bg_type_to_nparity(chunk->type_flags);
 	logical_stripe_nr = data_offset / chunk->stripe_len;
 	dev_stripe_nr = logical_stripe_nr / nr_data_stripes;
 
@@ -1899,19 +1884,19 @@ static int check_one_csum(int fd, u64 start, u32 len, u32 tree_csum,
 	int csum_size = 0;
 	u8 expected_csum[BTRFS_CSUM_SIZE];
 
-	ASSERT(0);
+	UASSERT(0);
 
 	data = malloc(len);
 	if (!data)
 		return -1;
-	ret = pread64(fd, data, len, start);
+	ret = pread(fd, data, len, start);
 	if (ret < 0 || ret != len) {
 		ret = -1;
 		goto out;
 	}
 	ret = 0;
 	put_unaligned_le32(tree_csum, expected_csum);
-	btrfs_csum_data(csum_type, (u8 *)data, result, len);
+	btrfs_csum_data(NULL, csum_type, (u8 *)data, result, len);
 	if (memcmp(result, expected_csum, csum_size) != 0)
 		ret = 1;
 out:
@@ -1922,9 +1907,9 @@ out:
 static u64 item_end_offset(struct btrfs_root *root, struct btrfs_key *key,
 			   struct extent_buffer *leaf, int slot) {
 	u32 blocksize = root->fs_info->sectorsize;
-	u16 csum_size = btrfs_super_csum_size(root->fs_info->super_copy);
+	u16 csum_size = root->fs_info->csum_size;
 
-	u64 offset = btrfs_item_size_nr(leaf, slot);
+	u64 offset = btrfs_item_size(leaf, slot);
 	offset /= csum_size;
 	offset *= blocksize;
 	offset += key->offset;
@@ -1947,7 +1932,7 @@ static int insert_stripe(struct list_head *devexts,
 		return -ENOENT;
 	if (btrfs_find_device_by_devid(rc->fs_devices, devext->objectid, 1)) {
 		error("unexpected: found another device with id %llu",
-				(unsigned long long)devext->objectid);
+				devext->objectid);
 		return -EINVAL;
 	}
 
@@ -1988,7 +1973,7 @@ static int fill_chunk_up(struct chunk_record *chunk, struct list_head *devexts,
 	return ret;
 }
 
-#define EQUAL_STRIPE (1 << 0)
+#define EQUAL_STRIPE (1U << 0)
 
 static int rebuild_raid_data_chunk_stripes(struct recover_control *rc,
 					   struct btrfs_root *root,
@@ -1998,7 +1983,7 @@ static int rebuild_raid_data_chunk_stripes(struct recover_control *rc,
 	int i;
 	int ret = 0;
 	int slot;
-	struct btrfs_path path;
+	struct btrfs_path path = { 0 };
 	struct btrfs_key prev_key;
 	struct btrfs_key key;
 	struct btrfs_root *csum_root;
@@ -2018,8 +2003,6 @@ static int rebuild_raid_data_chunk_stripes(struct recover_control *rc,
 	LIST_HEAD(unordered);
 	LIST_HEAD(candidates);
 
-	csum_root = root->fs_info->csum_root;
-	btrfs_init_path(&path);
 	list_splice_init(&chunk->dextents, &candidates);
 again:
 	if (list_is_last(candidates.next, &candidates))
@@ -2029,6 +2012,7 @@ again:
 	key.type = BTRFS_EXTENT_CSUM_KEY;
 	key.offset = start;
 
+	csum_root = btrfs_csum_root(root->fs_info, start);
 	ret = btrfs_search_slot(NULL, csum_root, &key, &path, 0, 0);
 	if (ret < 0) {
 		fprintf(stderr, "Search csum failed(%d)\n", ret);
@@ -2046,8 +2030,8 @@ again:
 			} else if (ret > 0) {
 				slot = btrfs_header_nritems(leaf) - 1;
 				btrfs_item_key_to_cpu(leaf, &key, slot);
-				if (item_end_offset(root, &key, leaf, slot)
-								> start) {
+				if (item_end_offset(csum_root, &key,
+						    leaf, slot) > start) {
 					csum_offset = start - key.offset;
 					csum_offset /= blocksize;
 					goto next_csum;
@@ -2085,8 +2069,8 @@ again:
 			goto out;
 	}
 next_csum:
-	ret = next_csum(root, &leaf, &path, &slot, &csum_offset, &tree_csum,
-			end, &key);
+	ret = next_csum(csum_root, &leaf, &path, &slot, &csum_offset,
+			&tree_csum, end, &key);
 	if (ret < 0) {
 		fprintf(stderr, "Fetch csum failed\n");
 		goto fail_out;
@@ -2192,8 +2176,8 @@ static int btrfs_rebuild_ordered_data_chunk_stripes(struct recover_control *rc,
 	u8 flags;
 
 	list_for_each_entry_safe(chunk, next, &rc->unrepaired_chunks, list) {
-		if ((chunk->type_flags & BTRFS_BLOCK_GROUP_DATA)
-		 && (chunk->type_flags & BTRFS_ORDERED_RAID)) {
+		if ((chunk->type_flags & BTRFS_BLOCK_GROUP_DATA) &&
+		    btrfs_bg_type_is_stripey(chunk->type_flags)) {
 			flags = 0;
 			err = rebuild_raid_data_chunk_stripes(rc, root, chunk,
 							      &flags);
@@ -2245,17 +2229,16 @@ static int btrfs_recover_chunks(struct recover_control *rc)
 		chunk->io_width = BTRFS_STRIPE_LEN;
 		chunk->io_align = BTRFS_STRIPE_LEN;
 		chunk->sector_size = rc->sectorsize;
-		chunk->sub_stripes = calc_sub_nstripes(bg->flags);
+		chunk->sub_stripes = btrfs_bg_type_to_sub_stripes(bg->flags);
 
 		ret = insert_cache_extent(&rc->chunk, &chunk->cache);
-		if (ret == -EEXIST) {
-			error("duplicate entry in cache start %llu size %llu",
-					(unsigned long long)chunk->cache.start,
-					(unsigned long long)chunk->cache.size);
+		if (ret < 0) {
+			errno = -ret;
+			error("cannot insert extent to cache start %llu size %llu",
+					chunk->cache.start, chunk->cache.size);
 			free(chunk);
 			return ret;
 		}
-		BUG_ON(ret);
 
 		list_del_init(&bg->list);
 		if (!nstripes) {

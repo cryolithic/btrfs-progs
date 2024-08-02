@@ -21,8 +21,19 @@
 #ifndef __BTRFS_CHECK_MODE_COMMON_H__
 #define __BTRFS_CHECK_MODE_COMMON_H__
 
+#include "kerncompat.h"
 #include <sys/stat.h>
+#include <stdbool.h>
+#include "kernel-lib/list.h"
+#include "kernel-shared/uapi/btrfs_tree.h"
 #include "kernel-shared/ctree.h"
+#include "common/messages.h"
+
+struct btrfs_trans_handle;
+struct extent_buffer;
+struct task_ctx;
+
+extern struct task_ctx g_task_ctx;
 
 #define FREE_SPACE_CACHE_INODE_MODE	(0100600)
 /*
@@ -69,11 +80,10 @@ extern u64 data_bytes_allocated;
 extern u64 data_bytes_referenced;
 extern struct list_head duplicate_extents;
 extern struct list_head delete_items;
-extern int no_holes;
-extern int init_extent_tree;
-extern int check_data_csum;
+extern bool no_holes;
+extern bool init_extent_tree;
+extern bool check_data_csum;
 extern struct btrfs_fs_info *gfs_info;
-extern struct task_ctx ctx;
 extern struct cache_tree *roots_info_cache;
 
 static inline u8 imode_to_type(u32 imode)
@@ -93,11 +103,11 @@ static inline u8 imode_to_type(u32 imode)
 #undef S_SHIFT
 }
 
-static inline int fs_root_objectid(u64 objectid)
+static inline bool fs_root_objectid(u64 objectid)
 {
 	if (objectid == BTRFS_TREE_RELOC_OBJECTID ||
 	    objectid == BTRFS_DATA_RELOC_TREE_OBJECTID)
-		return 1;
+		return true;
 	return is_fstree(objectid);
 }
 
@@ -157,39 +167,35 @@ static inline bool is_valid_imode(u32 imode)
 
 int recow_extent_buffer(struct btrfs_root *root, struct extent_buffer *eb);
 
-static inline u32 btrfs_type_to_imode(u8 type)
-{
-	static u32 imode_by_btrfs_type[] = {
-		[BTRFS_FT_REG_FILE]	= S_IFREG,
-		[BTRFS_FT_DIR]		= S_IFDIR,
-		[BTRFS_FT_CHRDEV]	= S_IFCHR,
-		[BTRFS_FT_BLKDEV]	= S_IFBLK,
-		[BTRFS_FT_FIFO]		= S_IFIFO,
-		[BTRFS_FT_SOCK]		= S_IFSOCK,
-		[BTRFS_FT_SYMLINK]	= S_IFLNK,
-	};
-
-	return imode_by_btrfs_type[(type)];
-}
-
 int get_extent_item_generation(u64 bytenr, u64 *gen_ret);
 
 /*
- * Check tree block alignment for future subpage support on 64K page system.
+ * Check tree block alignment for future subpage support.
  *
- * Subpage support on 64K page size require one eb to be completely contained
- * by a page. Not allowing a tree block to cross 64K page boundary.
+ * For subpage support, either nodesize is smaller than PAGE_SIZE, then tree
+ * block should not cross page boundary. (A)
+ * Or nodesize >= PAGE_SIZE, then it should be page aligned. (B)
  *
- * Since subpage support is still under development, this check only provides
- * warning.
+ * But here we have no idea the PAGE_SIZE could be, so here we play safe by
+ * requiring all tree blocks to be nodesize aligned.
+ *
+ * For 4K page size system, it always meets condition (B), thus we don't need
+ * to bother that much.
  */
-static inline void btrfs_check_subpage_eb_alignment(u64 start, u32 len)
+static inline void btrfs_check_subpage_eb_alignment(struct btrfs_fs_info *info,
+						    u64 start, u32 len)
 {
-	if (start / BTRFS_MAX_METADATA_BLOCKSIZE !=
-	    (start + len - 1) / BTRFS_MAX_METADATA_BLOCKSIZE)
+	if (!IS_ALIGNED(start, info->nodesize))
 		warning(
-"tree block [%llu, %llu) crosses 64K page boundary, may cause problem for 64K page system",
+"tree block [%llu, %llu) is not nodesize aligned, may cause problem for 64K page system",
 			start, start + len);
 }
+
+int repair_dev_item_bytes_used(struct btrfs_fs_info *fs_info,
+			       u64 devid, u64 bytes_used_expected);
+
+int fill_csum_tree(struct btrfs_trans_handle *trans, bool search_fs_tree);
+
+int check_and_repair_super_num_devs(struct btrfs_fs_info *fs_info);
 
 #endif

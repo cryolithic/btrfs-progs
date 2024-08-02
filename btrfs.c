@@ -14,20 +14,41 @@
  * Boston, MA 021110-1307, USA.
  */
 
+#include "kerncompat.h"
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
-
+#include <stdbool.h>
+#include <strings.h>
 #include "kernel-shared/volumes.h"
-#include "crypto/crc32c.h"
-#include "cmds/commands.h"
+#include "crypto/hash.h"
+#include "common/cpu-utils.h"
 #include "common/utils.h"
+#include "common/string-utils.h"
 #include "common/help.h"
 #include "common/box.h"
+#include "common/messages.h"
+#include "cmds/commands.h"
 
 static const char * const btrfs_cmd_group_usage[] = {
-	"btrfs [--help] [--version] [--format <format>] [-v|--verbose] [-q|--quiet] <group> [<group>...] <command> [<args>]",
+	/*
+	 * The main command group is the only one that takes options so this
+	 * needs the newlines and manual formatting.
+	 */
+	"btrfs [global] <group> [<group>...] <command> [<args>]\n"
+	"\n"
+	"Global options:\n"
+	"  --format <format> if supported, print subcommand output in that format (text, json)\n"
+	"  -v|--verbose      increase verbosity of the subcommand\n"
+	"  -q|--quiet        print only errors\n"
+	"  --log <level>     set log level (default, info, verbose, debug, quiet)\n"
+	"  --dry-run         if supported, do not do any active/changing actions\n"
+	"\n"
+	"Options for the main command only:\n"
+	"  --help            print condensed help for all subcommands\n"
+	"  --version         print version string",
 	NULL
 };
 
@@ -52,7 +73,7 @@ static int parse_one_token(const char *arg, const struct cmd_group *grp,
 
 		rest = skip_prefix(arg, cmd->token);
 		if (!rest) {
-			if (!prefixcmp(cmd->token, arg)) {
+			if (!string_has_prefix(cmd->token, arg)) {
 				if (abbrev_cmd) {
 					/*
 					 * If this is abbreviated, it is
@@ -99,15 +120,19 @@ parse_command_token(const char *arg, const struct cmd_group *grp)
 	return cmd;
 }
 
-static void check_output_format(const struct cmd_struct *cmd)
+static void check_command_flags(const struct cmd_struct *cmd)
 {
 	if (cmd->next)
 		return;
 
 	if (!(cmd->flags & bconf.output_format & CMD_FORMAT_MASK)) {
-		fprintf(stderr,
-			"ERROR: output format %s is unsupported for this command\n",
+		error("output format %s is unsupported for this command",
 			output_format_name(bconf.output_format));
+		exit(1);
+	}
+
+	if (bconf.dry_run && !(cmd->flags & CMD_DRY_RUN)) {
+		error("--dry-run option not supported for %s\n", cmd->token);
 		exit(1);
 	}
 }
@@ -146,7 +171,7 @@ int handle_command_group(const struct cmd_struct *cmd, int argc,
 	subcmd = parse_command_token(argv[0], cmd->next);
 
 	handle_help_options_next_level(subcmd, argc, argv);
-	check_output_format(subcmd);
+	check_command_flags(subcmd);
 
 	fixup_argv0(argv, subcmd->token);
 	return cmd_execute(subcmd, argc, argv);
@@ -158,8 +183,8 @@ static const char * const cmd_help_usage[] = {
 	"btrfs help [--full] [--box]",
 	"Display help information",
 	"",
-	"--full     display detailed help on every command",
-	"--box      show list of built-in tools (busybox style)",
+	OPTLINE("--full", "display detailed help on every command"),
+	OPTLINE("--box", "show list of built-in tools (busybox style)"),
 	NULL
 };
 
@@ -196,7 +221,62 @@ static const char * const cmd_version_usage[] = {
 
 static int cmd_version(const struct cmd_struct *unused, int argc, char **argv)
 {
+	static const char *features[] = {
+#if EXPERIMENTAL
+		"+"
+#else
+		"-"
+#endif
+		"EXPERIMENTAL",
+#ifdef INJECT
+		"+"
+#else
+		"-"
+#endif
+		"INJECT",
+#ifdef STATIC_BUILD
+		"+"
+#else
+		"-"
+#endif
+		"STATIC",
+#if defined(COMPRESSION_LZO) && COMPRESSION_LZO == 1
+		"+"
+#else
+		"-"
+#endif
+		"LZO",
+#if defined(COMPRESSION_ZSTD) && COMPRESSION_ZSTD == 1
+		"+"
+#else
+		"-"
+#endif
+		"ZSTD",
+#if defined(HAVE_LIBUDEV) && HAVE_LIBUDEV == 1
+		"+"
+#else
+		"-"
+#endif
+		"UDEV",
+#if defined(HAVE_LINUX_FSVERITY_H) && HAVE_LINUX_FSVERITY_H == 1
+		"+"
+#else
+		"-"
+#endif
+		"FSVERITY",
+#if defined(BTRFS_ZONED) && BTRFS_ZONED == 1
+		"+"
+#else
+		"-"
+#endif
+		"ZONED",
+		"CRYPTO=" CRYPTOPROVIDER,
+	};
+
 	printf("%s\n", PACKAGE_STRING);
+	for (int i = 0; i < ARRAY_SIZE(features); i++)
+		printf("%s%s", (i == 0 ? "" : " "), features[i]);
+	putchar('\n');
 	return 0;
 }
 static DEFINE_SIMPLE_COMMAND(version, "version");
@@ -234,6 +314,23 @@ static void handle_output_format(const char *format)
 	}
 }
 
+static void handle_log_level(const char *level) {
+	if (strcasecmp(level, "default") == 0) {
+		bconf.verbose = LOG_DEFAULT;
+	} else if (strcasecmp(level, "info") == 0) {
+		bconf.verbose = LOG_INFO;
+	} else if (strcasecmp(level, "verbose") == 0) {
+		bconf.verbose = LOG_VERBOSE;
+	} else if (strcasecmp(level, "debug") == 0) {
+		bconf.verbose = LOG_DEBUG;
+	} else if (strcasecmp(level, "quiet") == 0) {
+		bconf.verbose = BTRFS_BCONF_QUIET;
+	} else {
+		error("unrecognized log level: %s", level);
+		exit(1);
+	}
+}
+
 /*
  * Parse global options, between binary name and first non-option argument
  * after processing all valid options (including those with arguments).
@@ -242,7 +339,7 @@ static void handle_output_format(const char *format)
  */
 static int handle_global_options(int argc, char **argv)
 {
-	enum { OPT_HELP = 256, OPT_VERSION, OPT_FULL, OPT_FORMAT };
+	enum { OPT_HELP = 256, OPT_VERSION, OPT_FULL, OPT_FORMAT, OPT_LOG };
 	static const struct option long_options[] = {
 		{ "help", no_argument, NULL, OPT_HELP },
 		{ "version", no_argument, NULL, OPT_VERSION },
@@ -250,6 +347,9 @@ static int handle_global_options(int argc, char **argv)
 		{ "full", no_argument, NULL, OPT_FULL },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "quiet", no_argument, NULL, 'q' },
+		{ "log", required_argument, NULL, OPT_LOG },
+		{ "param", required_argument, NULL, GETOPT_VAL_PARAM },
+		{ "dry-run", no_argument, NULL, GETOPT_VAL_DRY_RUN },
 		{ NULL, 0, NULL, 0}
 	};
 	int shift;
@@ -271,6 +371,15 @@ static int handle_global_options(int argc, char **argv)
 		case OPT_FULL: break;
 		case OPT_FORMAT:
 			handle_output_format(optarg);
+			break;
+		case OPT_LOG:
+			handle_log_level(optarg);
+			break;
+		case GETOPT_VAL_PARAM:
+			bconf_save_param(optarg);
+			break;
+		case GETOPT_VAL_DRY_RUN:
+			bconf_set_dry_run();
 			break;
 		case 'v':
 			bconf_be_verbose();
@@ -340,6 +449,9 @@ static const struct cmd_group btrfs_cmd_group = {
 		&cmd_struct_qgroup,
 		&cmd_struct_quota,
 		&cmd_struct_receive,
+#if EXPERIMENTAL
+		&cmd_struct_reflink,
+#endif
 		&cmd_struct_replace,
 		&cmd_struct_rescue,
 		&cmd_struct_restore,
@@ -378,6 +490,8 @@ int main(int argc, char **argv)
 		return convert_main(argc, argv);
 	} else if (!strcmp(bname, "btrfstune")) {
 		return btrfstune_main(argc, argv);
+	} else if (!strcmp(bname, "btrfs-find-root")) {
+		return find_root_main(argc, argv);
 #endif
 	} else {
 		int shift;
@@ -397,9 +511,8 @@ int main(int argc, char **argv)
 	cmd = parse_command_token(argv[0], &btrfs_cmd_group);
 
 	handle_help_options_next_level(cmd, argc, argv);
-
-	crc32c_optimization_init();
-
+	cpu_detect_flags();
+	hash_init_accel();
 	fixup_argv0(argv, cmd->token);
 
 	ret = cmd_execute(cmd, argc, argv);

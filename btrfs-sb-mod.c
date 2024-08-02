@@ -15,11 +15,11 @@
  */
 
 #include "kerncompat.h"
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <sys/fcntl.h>
-#include <sys/stat.h>
 #include <inttypes.h>
 #include <string.h>
 #include <limits.h>
@@ -36,7 +36,7 @@ static int check_csum_superblock(void *sb)
 	u8 result[BTRFS_CSUM_SIZE];
 	u16 csum_type = btrfs_super_csum_type(sb);
 
-	btrfs_csum_data(csum_type, (unsigned char *)sb + BTRFS_CSUM_SIZE,
+	btrfs_csum_data(NULL, csum_type, (unsigned char *)sb + BTRFS_CSUM_SIZE,
 			result, BTRFS_SUPER_INFO_SIZE - BTRFS_CSUM_SIZE);
 
 	return !memcmp(sb, result, csum_size);
@@ -48,7 +48,7 @@ static void update_block_csum(void *block)
 	struct btrfs_header *hdr;
 	u16 csum_type = btrfs_super_csum_type(block);
 
-	btrfs_csum_data(csum_type, (unsigned char *)block + BTRFS_CSUM_SIZE,
+	btrfs_csum_data(NULL, csum_type, (unsigned char *)block + BTRFS_CSUM_SIZE,
 			result, BTRFS_SUPER_INFO_SIZE - BTRFS_CSUM_SIZE);
 
 	memset(block, 0, BTRFS_CSUM_SIZE);
@@ -83,7 +83,6 @@ static u64 arg_strtou64(const char *str)
         }
         return value;
 }
-
 
 enum field_op {
 	OP_GET,
@@ -120,7 +119,6 @@ struct sb_field {
 	{ .name = "root",			.type = TYPE_U64 },
 	{ .name = "chunk_root",			.type = TYPE_U64 },
 	{ .name = "log_root",			.type = TYPE_U64 },
-	{ .name = "log_root_transid",		.type = TYPE_U64 },
 	{ .name = "total_bytes",		.type = TYPE_U64 },
 	{ .name = "bytes_used",			.type = TYPE_U64 },
 	{ .name = "root_dir_objectid",		.type = TYPE_U64 },
@@ -211,6 +209,23 @@ struct sb_field {
 #define MOD_DEV_FIELD8(fname, set, val)					\
 	MOD_DEV_FIELD_XX(fname, set, val, 8, "%hhu", "%hhx", unsigned char)
 
+static bool op_is_write(enum field_op op)
+{
+	return op != OP_GET;
+}
+
+static const char * const type_to_string(enum field_type type)
+{
+	switch (type) {
+	case TYPE_U8:	return "u8";
+	case TYPE_U16:	return "u16";
+	case TYPE_U32:	return "u32";
+	case TYPE_U64:	return "u64";
+	case TYPE_UNKNOWN:
+	}
+	return "UNKNOWN";
+}
+
 static void mod_field_by_name(struct btrfs_super_block *sb, int set, const char *name,
 		u64 *val)
 {
@@ -222,7 +237,6 @@ static void mod_field_by_name(struct btrfs_super_block *sb, int set, const char 
 		MOD_FIELD(root, set, val)
 		MOD_FIELD(chunk_root, set, val)
 		MOD_FIELD(log_root, set, val)
-		MOD_FIELD(log_root_transid, set, val)
 		MOD_FIELD(total_bytes, set, val)
 		MOD_FIELD(bytes_used, set, val)
 		MOD_FIELD(root_dir_objectid, set, val)
@@ -325,10 +339,15 @@ int main(int argc, char **argv)
 
 	memset(spec, 0, sizeof(spec));
 	if (argc <= 2) {
-		printf("Usage: %s image [fieldspec...]\n", argv[0]);
-		printf("Where fileldspec is: member op\n");
-		printf("  member: name of the superblock member\n");
-		printf("  op: single character optionally followed by a value\n");
+		printf("Usage: %s [options] image [fieldspec...]\n", argv[0]);
+		printf("\n");
+		printf("Modify or read a a member of the primary superblock on a given image (file or block device),\n");
+		printf("checksum is recalculated after any modification (ie. it is not when just reading the values).\n");
+		printf("Use 'btrfs inspect dump-super image' to read the whole superblock\n");
+		printf("\n");
+		printf("fileldspec is a sequence of pairs 'member op':\n");
+		printf("  member: name of the superblock member, listed below\n");
+		printf("  op: single character optionally followed by a value (eg. =0x42)\n");
 		printf("    . read the member value (no value)\n");
 		printf("    ? read the member value (no value)\n");
 		printf("    = set member to the exact value (value required)\n");
@@ -336,6 +355,15 @@ int main(int argc, char **argv)
 		printf("    - subtract this value from member (value required)\n");
 		printf("    ^ xor member with this value (value required)\n");
 		printf("    @ byteswap of the member (no value)\n");
+		printf("\n");
+		printf("  member (type)\n");
+
+		for (i = 0; i < ARRAY_SIZE(known_fields); i++) {
+			const int width = 24;
+
+			printf("    %-*s  %s\n", width, known_fields[i].name,
+					type_to_string(known_fields[i].type));
+		}
 		exit(1);
 	}
 	fd = open(argv[1], O_RDWR | O_EXCL);
@@ -362,13 +390,12 @@ int main(int argc, char **argv)
 	hdr = (struct btrfs_header *)buf;
 	/* verify checksum */
 	if (!check_csum_superblock(&hdr->csum)) {
-		printf("super block checksum does not match at offset %llu, will be corrected\n",
+		printf("super block checksum does not match at offset %llu, will be corrected after write\n",
 				(unsigned long long)off);
 	} else {
 		printf("super block checksum is ok\n");
 	}
 	sb = (struct btrfs_super_block *)buf;
-	changed = 0;
 
 	specidx = 0;
 	for (i = 2; i < argc; i++) {
@@ -395,9 +422,11 @@ int main(int argc, char **argv)
 		}
 	}
 
+	changed = 0;
 	for (i = 0; i < specidx; i++) {
 		sb_edit(sb, &spec[i]);
-		changed = 1;
+		if (op_is_write(spec[i].fop))
+			changed = 1;
 	}
 
 	if (changed) {

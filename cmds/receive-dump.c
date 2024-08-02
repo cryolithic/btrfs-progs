@@ -11,30 +11,24 @@
  * General Public License for more details.
  *
  * You should have received a copy of the GNU General Public
- * License along with this program.
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
  */
 
-#include <unistd.h>
-#include <stdint.h>
-#include <dirent.h>
-#include <pthread.h>
-#include <math.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <sys/ioctl.h>
-#include <libgen.h>
-#include <mntent.h>
+#include "kerncompat.h"
 #include <limits.h>
-#include <stdlib.h>
 #include <time.h>
-#include <ctype.h>
-#include <asm/types.h>
+#include <errno.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
 #include <uuid/uuid.h>
-#include "common/utils.h"
-#include "cmds/commands.h"
-#include "common/send-utils.h"
+#include "common/defs.h"
+#include "common/messages.h"
 #include "common/send-stream.h"
+#include "common/path-utils.h"
+#include "common/string-utils.h"
 #include "cmds/receive-dump.h"
 
 #define PATH_CAT_OR_RET(function_name, outpath, path1, path2, ret)	\
@@ -46,53 +40,18 @@
 	}								\
 })
 
-/*
- * Print path and escape characters (in a C way) that could break the line.
- * Returns the length of the escaped characters. Unprintable characters are
- * escaped as octals.
- */
-static int print_path_escaped(const char *path)
-{
-	size_t i;
-	size_t path_len = strlen(path);
-	int len = 0;
-
-	for (i = 0; i < path_len; i++) {
-		char c = path[i];
-
-		len++;
-		switch (c) {
-		case '\a': putchar('\\'); putchar('a'); len++; break;
-		case '\b': putchar('\\'); putchar('b'); len++; break;
-		case '\e': putchar('\\'); putchar('e'); len++; break;
-		case '\f': putchar('\\'); putchar('f'); len++; break;
-		case '\n': putchar('\\'); putchar('n'); len++; break;
-		case '\r': putchar('\\'); putchar('r'); len++; break;
-		case '\t': putchar('\\'); putchar('t'); len++; break;
-		case '\v': putchar('\\'); putchar('v'); len++; break;
-		case ' ':  putchar('\\'); putchar(' '); len++; break;
-		case '\\': putchar('\\'); putchar('\\'); len++; break;
-		default:
-			  if (!isprint(c)) {
-				  printf("\\%c%c%c",
-						  '0' + ((c & 0300) >> 6),
-						  '0' + ((c & 070) >> 3),
-						  '0' + (c & 07));
-				  len += 3;
-			  } else {
-				  putchar(c);
-			  }
-		}
-	}
-	return len;
-}
+enum print_mode {
+	PRINT_DUMP_NORMAL,
+	PRINT_DUMP_SUBVOLUME,
+	PRINT_DUMP_NONEWLINE
+};
 
 /*
  * Underlying PRINT_DUMP, the only difference is how we handle
  * the full path.
  */
 __attribute__ ((format (printf, 5, 6)))
-static int __print_dump(int subvol, void *user, const char *path,
+static int __print_dump(enum print_mode mode, void *user, const char *path,
 			const char *title, const char *fmt, ...)
 {
 	struct btrfs_dump_send_args *r = user;
@@ -101,7 +60,7 @@ static int __print_dump(int subvol, void *user, const char *path,
 	va_list args;
 	int ret;
 
-	if (subvol) {
+	if (mode == PRINT_DUMP_SUBVOLUME) {
 		PATH_CAT_OR_RET(title, r->full_subvol_path, r->root_path, path, ret);
 		out_path = r->full_subvol_path;
 	} else {
@@ -111,7 +70,7 @@ static int __print_dump(int subvol, void *user, const char *path,
 
 	/* Unified header */
 	printf("%-16s", title);
-	ret = print_path_escaped(out_path);
+	ret = string_print_escape_special(out_path);
 	if (!fmt) {
 		putchar('\n');
 		return 0;
@@ -124,17 +83,22 @@ static int __print_dump(int subvol, void *user, const char *path,
 	/* Operation specified ones */
 	vprintf(fmt, args);
 	va_end(args);
-	putchar('\n');
+	if (mode != PRINT_DUMP_NONEWLINE)
+		putchar('\n');
 	return 0;
 }
 
 /* For subvolume/snapshot operation only */
 #define PRINT_DUMP_SUBVOL(user, path, title, fmt, ...) \
-	__print_dump(1, user, path, title, fmt, ##__VA_ARGS__)
+	__print_dump(PRINT_DUMP_SUBVOLUME, user, path, title, fmt, ##__VA_ARGS__)
 
 /* For other operations */
 #define PRINT_DUMP(user, path, title, fmt, ...) \
-	__print_dump(0, user, path, title, fmt, ##__VA_ARGS__)
+	__print_dump(PRINT_DUMP_NORMAL, user, path, title, fmt, ##__VA_ARGS__)
+
+/* For commands that may want to format parts of the line by themselves */
+#define PRINT_DUMP_NO_NEWLINE(user, path, title, fmt, ...) \
+	__print_dump(PRINT_DUMP_NONEWLINE, user, path, title, fmt, ##__VA_ARGS__)
 
 static int print_subvol(const char *path, const u8 *uuid, u64 ctransid,
 			void *user)
@@ -193,7 +157,10 @@ static int print_mksock(const char *path, void *user)
 
 static int print_symlink(const char *path, const char *lnk, void *user)
 {
-	return PRINT_DUMP(user, path, "symlink", "dest=%s", lnk);
+	PRINT_DUMP_NO_NEWLINE(user, path, "symlink", "dest=");
+	string_print_escape_special(lnk);
+	putchar('\n');
+	return 0;
 }
 
 static int print_rename(const char *from, const char *to, void *user)
@@ -203,12 +170,18 @@ static int print_rename(const char *from, const char *to, void *user)
 	int ret;
 
 	PATH_CAT_OR_RET("rename", full_to, r->full_subvol_path, to, ret);
-	return PRINT_DUMP(user, from, "rename", "dest=%s", full_to);
+	PRINT_DUMP_NO_NEWLINE(user, from, "rename", "dest=");
+	string_print_escape_special(full_to);
+	putchar('\n');
+	return 0;
 }
 
 static int print_link(const char *path, const char *lnk, void *user)
 {
-	return PRINT_DUMP(user, path, "link", "dest=%s", lnk);
+	PRINT_DUMP_NO_NEWLINE(user, path, "link", "dest=");
+	string_print_escape_special(lnk);
+	putchar('\n');
+	return 0;
 }
 
 static int print_unlink(const char *path, void *user)
@@ -237,24 +210,37 @@ static int print_clone(const char *path, u64 offset, u64 len,
 	char full_path[PATH_MAX];
 	int ret;
 
-	PATH_CAT_OR_RET("clone", full_path, r->full_subvol_path, clone_path,
-			ret);
-	return PRINT_DUMP(user, path, "clone",
-			  "offset=%llu len=%llu from=%s clone_offset=%llu",
-			  offset, len, full_path, clone_offset);
+	PATH_CAT_OR_RET("clone", full_path, r->full_subvol_path, clone_path, ret);
+	PRINT_DUMP_NO_NEWLINE(user, path, "clone", "offset=%llu len=%llu from=", offset, len);
+	string_print_escape_special(full_path);
+	putchar(' ');
+	printf("clone_offset=%llu\n", clone_offset);
+	return 0;
 }
 
+/*
+ * Xattr names are like paths and can potentially contain special characters,
+ * xattr values can be arbitrary.
+ */
 static int print_set_xattr(const char *path, const char *name,
 			   const void *data, int len, void *user)
 {
-	return PRINT_DUMP(user, path, "set_xattr", "name=%s data=%.*s len=%d",
-			  name, len, (char *)data, len);
+	PRINT_DUMP_NO_NEWLINE(user, path, "set_xattr", "name=");
+	string_print_escape_special(name);
+	putchar(' ');
+	string_print_escape_special_len((const char *)data, len);
+	putchar(' ');
+	printf("len=%d\n", len);
+	return 0;
 }
 
 static int print_remove_xattr(const char *path, const char *name, void *user)
 {
 
-	return PRINT_DUMP(user, path, "remove_xattr", "name=%s", name);
+	PRINT_DUMP_NO_NEWLINE(user, path, "remove_xattr", "name=");
+	string_print_escape_special(name);
+	putchar('\n');
+	return 0;
 }
 
 static int print_truncate(const char *path, u64 size, void *user)
@@ -316,6 +302,39 @@ static int print_update_extent(const char *path, u64 offset, u64 len,
 			  offset, len);
 }
 
+static int print_encoded_write(const char *path, const void *data, u64 offset,
+			       u64 len, u64 unencoded_file_len,
+			       u64 unencoded_len, u64 unencoded_offset,
+			       u32 compression, u32 encryption, void *user)
+{
+	return PRINT_DUMP(user, path, "encoded_write",
+"offset=%llu len=%llu unencoded_file_len=%llu unencoded_len=%llu unencoded_offset=%llu compression=%u encryption=%u",
+			  offset, len, unencoded_file_len, unencoded_len,
+			  unencoded_offset, compression, encryption);
+}
+
+static int print_fallocate(const char *path, int mode, u64 offset, u64 len,
+			   void *user)
+{
+	return PRINT_DUMP(user, path, "fallocate",
+			  "mode=%d offset=%llu len=%llu",
+			  mode, offset, len);
+}
+
+static int print_fileattr(const char *path, u64 attr, void *user)
+{
+	return PRINT_DUMP(user, path, "fileattr", "fileattr=0x%llu", attr);
+}
+
+static int print_enable_verity (const char *path, u8 algorithm, u32 block_size,
+				int salt_len, char *salt,
+				int sig_len, char *sig, void *user)
+{
+	return PRINT_DUMP(user, path, "enable_verity",
+			  "algorithm=%u block_size=%u salt_len=%d sig_len=%d",
+			  algorithm, block_size, salt_len, sig_len);
+}
+
 struct btrfs_send_ops btrfs_print_send_ops = {
 	.subvol = print_subvol,
 	.snapshot = print_snapshot,
@@ -337,5 +356,9 @@ struct btrfs_send_ops btrfs_print_send_ops = {
 	.chmod = print_chmod,
 	.chown = print_chown,
 	.utimes = print_utimes,
-	.update_extent = print_update_extent
+	.update_extent = print_update_extent,
+	.encoded_write = print_encoded_write,
+	.fallocate = print_fallocate,
+	.fileattr = print_fileattr,
+	.enable_verity = print_enable_verity,
 };

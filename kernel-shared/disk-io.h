@@ -20,11 +20,19 @@
 #define __BTRFS_DISK_IO_H__
 
 #include "kerncompat.h"
-#include "kernel-shared/ctree.h"
+#include <stddef.h>
+#include "kernel-lib/bitops.h"
 #include "kernel-lib/sizes.h"
+#include "kernel-shared/ctree.h"
+#include "kernel-shared/uapi/btrfs.h"
 
-#define BTRFS_SUPER_INFO_OFFSET SZ_64K
-#define BTRFS_SUPER_INFO_SIZE 4096
+struct btrfs_tree_parent_check;
+struct btrfs_fs_devices;
+struct btrfs_key;
+struct btrfs_super_block;
+struct btrfs_trans_handle;
+struct extent_buffer;
+struct rb_node;
 
 #define BTRFS_SUPER_MIRROR_MAX	 3
 #define BTRFS_SUPER_MIRROR_SHIFT 12
@@ -88,6 +96,30 @@ enum btrfs_open_ctree_flags {
 
 	/* For print-tree, print HIDDEN instead of filenames/xattrs/refs */
 	OPEN_CTREE_HIDE_NAMES = (1U << 14),
+
+	/*
+	 * Allow certain commands like check/restore to ignore transid
+	 * mismatch.
+	 */
+	OPEN_CTREE_ALLOW_TRANSID_MISMATCH = (1U << 15),
+
+	/*
+	 * Do not check checksums at all for data and metadata, eg. when the
+	 * superblock type of checksum does not match the actual checksum items
+	 * stored in the csum tree during conversion.
+	 */
+	OPEN_CTREE_SKIP_CSUM_CHECK	= (1U << 16),
+
+	/*
+	 * Allow certain commands like check/restore to ignore more structure
+	 * specific checks and only do the superficial checks.
+	 */
+	OPEN_CTREE_SKIP_LEAF_ITEM_CHECKS	= (1U << 17),
+
+	/*
+	 * Use the superblock of the latest device for the transaction commit.
+	 */
+	OPEN_CTREE_USE_LATEST_BDEV		= (1U << 18),
 };
 
 /*
@@ -96,19 +128,19 @@ enum btrfs_open_ctree_flags {
 enum btrfs_read_sb_flags {
 	SBREAD_DEFAULT		= 0,
 	/* Reading superblock during recovery */
-	SBREAD_RECOVER		= (1 << 0),
+	SBREAD_RECOVER		= (1U << 0),
 
 	/*
 	 * Read superblock with the fake signature, cannot be used with
 	 * SBREAD_RECOVER
 	 */
-	SBREAD_TEMPORARY = (1 << 1),
+	SBREAD_TEMPORARY	= (1U << 1),
 
 	/*
 	 * Equivalent of OPEN_CTREE_IGNORE_FSID_MISMATCH, allow to read
 	 * superblock that has mismatched sb::fsid and sb::dev_item.fsid
 	 */
-	SBREAD_IGNORE_FSID_MISMATCH = (1 << 2),
+	SBREAD_IGNORE_FSID_MISMATCH = (1U << 2),
 };
 
 /*
@@ -128,11 +160,9 @@ static inline u64 btrfs_sb_offset(int mirror)
 struct btrfs_device;
 
 int read_whole_eb(struct btrfs_fs_info *info, struct extent_buffer *eb, int mirror);
-struct extent_buffer* read_tree_block(struct btrfs_fs_info *fs_info, u64 bytenr,
-		u64 parent_transid);
+struct extent_buffer *read_tree_block(struct btrfs_fs_info *fs_info, u64 bytenr,
+				      struct btrfs_tree_parent_check *check);
 
-int read_extent_data(struct btrfs_fs_info *fs_info, char *data, u64 logical,
-		     u64 *len, int mirror);
 void readahead_tree_block(struct btrfs_fs_info *fs_info, u64 bytenr,
 			  u64 parent_transid);
 struct extent_buffer* btrfs_find_create_tree_block(
@@ -160,10 +190,15 @@ struct btrfs_root *open_ctree(const char *filename, u64 sb_bytenr,
 			      unsigned flags);
 struct btrfs_root *open_ctree_fd(int fp, const char *path, u64 sb_bytenr,
 				 unsigned flags);
-struct btrfs_fs_info *open_ctree_fs_info(const char *filename,
-					 u64 sb_bytenr, u64 root_tree_bytenr,
-					 u64 chunk_root_bytenr,
-					 unsigned flags);
+struct open_ctree_args {
+	const char *filename;
+	u64 sb_bytenr;
+	u64 root_tree_bytenr;
+	u64 chunk_tree_bytenr;
+	unsigned flags;
+};
+
+struct btrfs_fs_info *open_ctree_fs_info(struct open_ctree_args *oca);
 int close_ctree_fs_info(struct btrfs_fs_info *fs_info);
 static inline int close_ctree(struct btrfs_root *root)
 {
@@ -187,9 +222,11 @@ struct btrfs_root *btrfs_read_fs_root_no_cache(struct btrfs_fs_info *fs_info,
 					       struct btrfs_key *location);
 int btrfs_free_fs_root(struct btrfs_root *root);
 void btrfs_mark_buffer_dirty(struct extent_buffer *buf);
-int btrfs_buffer_uptodate(struct extent_buffer *buf, u64 parent_transid);
+int btrfs_buffer_uptodate(struct extent_buffer *buf, u64 parent_transid,
+			  int atomic);
 int btrfs_set_buffer_uptodate(struct extent_buffer *buf);
-int btrfs_csum_data(u16 csum_type, const u8 *data, u8 *out, size_t len);
+int btrfs_csum_data(struct btrfs_fs_info *fs_info, u16 csum_type, const u8 *data,
+		    u8 *out, size_t len);
 
 int btrfs_open_device(struct btrfs_device *dev);
 int csum_tree_block_size(struct extent_buffer *buf, u16 csum_sectorsize,
@@ -200,10 +237,30 @@ int btrfs_read_buffer(struct extent_buffer *buf, u64 parent_transid);
 int write_tree_block(struct btrfs_trans_handle *trans,
 		     struct btrfs_fs_info *fs_info,
 		     struct extent_buffer *eb);
-int write_and_map_eb(struct btrfs_fs_info *fs_info, struct extent_buffer *eb);
-int btrfs_fs_roots_compare_roots(struct rb_node *node1, struct rb_node *node2);
+int btrfs_fs_roots_compare_roots(const struct rb_node *node1, const struct rb_node *node2);
 struct btrfs_root *btrfs_create_tree(struct btrfs_trans_handle *trans,
-				     struct btrfs_fs_info *fs_info,
-				     u64 objectid);
+				     struct btrfs_key *key);
+int btrfs_delete_and_free_root(struct btrfs_trans_handle *trans,
+			       struct btrfs_root *root);
+struct btrfs_root *btrfs_csum_root(struct btrfs_fs_info *fs_info, u64 bytenr);
+struct btrfs_root *btrfs_extent_root(struct btrfs_fs_info *fs_inf, u64 bytenr);
+struct btrfs_root *btrfs_global_root(struct btrfs_fs_info *fs_info,
+				     struct btrfs_key *key);
+u64 btrfs_global_root_id(struct btrfs_fs_info *fs_info, u64 bytenr);
+int btrfs_global_root_insert(struct btrfs_fs_info *fs_info,
+			     struct btrfs_root *root);
+int btrfs_find_and_setup_root(struct btrfs_root *tree_root,
+			      struct btrfs_fs_info *fs_info,
+			      u64 objectid, struct btrfs_root *root);
+int btrfs_read_extent_buffer(struct extent_buffer *eb,
+			     struct btrfs_tree_parent_check *check);
+
+static inline struct btrfs_root *btrfs_block_group_root(
+						struct btrfs_fs_info *fs_info)
+{
+	if (btrfs_fs_compat_ro(fs_info, BLOCK_GROUP_TREE))
+		return fs_info->block_group_root;
+	return btrfs_extent_root(fs_info, 0);
+}
 
 #endif

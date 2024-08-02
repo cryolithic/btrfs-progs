@@ -1,7 +1,7 @@
 #!/bin/bash
 # Test if mkfs.btrfs --rootdir will skip shrinking correctly
 
-source "$TEST_TOP/common"
+source "$TEST_TOP/common" || exit
 
 check_prereq mkfs.btrfs
 
@@ -9,7 +9,7 @@ setup_root_helper
 
 fs_size=$((512 * 1024 * 1024))
 bs=$((1024 * 1024))
-tmp=$(mktemp -d --tmpdir btrfs-progs-mkfs.rootdirXXXXXXX)
+tmp=$(_mktemp_dir mkfs-rootdir)
 
 prepare_test_dev "$fs_size"
 

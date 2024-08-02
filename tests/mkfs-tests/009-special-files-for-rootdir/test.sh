@@ -6,7 +6,7 @@
 #
 # Note: sock type is skipped in this test
 
-source "$TEST_TOP/common"
+source "$TEST_TOP/common" || exit
 
 check_prereq mkfs.btrfs
 check_prereq btrfs
@@ -20,7 +20,7 @@ prepare_test_dev
 check_global_prereq mknod
 check_global_prereq dd
 
-tmp=$(mktemp -d --tmpdir btrfs-progs-mkfs.rootdirXXXXXXX)
+tmp=$(_mktemp_dir mkfs-rootdir)
 
 run_check mkdir "$tmp/dir"
 run_check mkdir -p "$tmp/dir/in/dir"

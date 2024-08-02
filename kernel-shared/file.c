@@ -16,12 +16,21 @@
  * Boston, MA 021110-1307, USA.
  */
 
-#include <sys/stat.h>
-#include "kernel-shared/ctree.h"
-#include "common/utils.h"
-#include "kernel-shared/disk-io.h"
-#include "kernel-shared/transaction.h"
 #include "kerncompat.h"
+#include <errno.h>
+#include <string.h>
+#include "kernel-lib/bitops.h"
+#include "kernel-shared/accessors.h"
+#include "kernel-shared/extent_io.h"
+#include "kernel-shared/uapi/btrfs.h"
+#include "kernel-shared/uapi/btrfs_tree.h"
+#include "kernel-shared/ctree.h"
+#include "kernel-shared/compression.h"
+#include "kernel-shared/file-item.h"
+#include "common/internal.h"
+#include "common/messages.h"
+
+struct btrfs_trans_handle;
 
 /*
  * Get the first file extent that covers (part of) the given range
@@ -185,7 +194,7 @@ int btrfs_read_file(struct btrfs_root *root, u64 ino, u64 start, int len,
 {
 	struct btrfs_fs_info *fs_info = root->fs_info;
 	struct btrfs_key key;
-	struct btrfs_path path;
+	struct btrfs_path path = { 0 };
 	struct extent_buffer *leaf;
 	struct btrfs_inode_item *ii;
 	u64 isize;
@@ -201,10 +210,9 @@ int btrfs_read_file(struct btrfs_root *root, u64 ino, u64 start, int len,
 		return -EINVAL;
 	}
 
-	btrfs_init_path(&path);
 	key.objectid = ino;
-	key.offset = start;
 	key.type = BTRFS_EXTENT_DATA_KEY;
+	key.offset = start;
 
 	ret = btrfs_search_slot(NULL, root, &key, &path, 0, 0);
 	if (ret < 0)
@@ -225,11 +233,11 @@ int btrfs_read_file(struct btrfs_root *root, u64 ino, u64 start, int len,
 	memset(dest, 0, len);
 	while (1) {
 		struct btrfs_file_extent_item *fi;
+		u64 offset = 0;
 		u64 extent_start;
 		u64 extent_len;
 		u64 read_start;
 		u64 read_len;
-		u64 read_len_ret;
 		u64 disk_bytenr;
 
 		leaf = path.nodes[0];
@@ -282,14 +290,16 @@ int btrfs_read_file(struct btrfs_root *root, u64 ino, u64 start, int len,
 
 		disk_bytenr = btrfs_file_extent_disk_bytenr(leaf, fi) +
 			      btrfs_file_extent_offset(leaf, fi);
-		read_len_ret = read_len;
-		ret = read_extent_data(fs_info, dest + read_start - start, disk_bytenr,
-				       &read_len_ret, 0);
-		if (ret < 0)
-			break;
-		/* Short read, something went wrong */
-		if (read_len_ret != read_len)
-			return -EIO;
+		while (offset < read_len) {
+			u64 read_len_ret = read_len - offset;
+
+			ret = read_data_from_disk(fs_info,
+					dest + read_start - start + offset,
+					disk_bytenr + offset, &read_len_ret, 0);
+			if (ret < 0)
+				goto out;
+			offset += read_len_ret;
+		}
 		read += read_len;
 next:
 		ret = btrfs_next_item(root, &path);
@@ -307,8 +317,8 @@ next:
 	if (no_holes) {
 		btrfs_release_path(&path);
 		key.objectid = ino;
-		key.offset = 0;
 		key.type = BTRFS_INODE_ITEM_KEY;
+		key.offset = 0;
 		ret = btrfs_lookup_inode(NULL, root, &path, &key, 0);
 		if (ret < 0)
 			goto out;

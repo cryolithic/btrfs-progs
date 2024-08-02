@@ -2,7 +2,7 @@
 #
 # Corrupt primary superblock and restore it using backup superblock.
 
-source "$TEST_TOP/common"
+source "$TEST_TOP/common" || exit
 
 check_prereq btrfs-select-super
 check_prereq btrfs
@@ -14,6 +14,8 @@ FIRST_SUPERBLOCK_OFFSET=65536
 
 test_superblock_restore()
 {
+	local seek
+
 	run_check_mkfs_test_dev
 
 	# Corrupt superblock checksum

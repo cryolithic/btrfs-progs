@@ -18,10 +18,11 @@
 #define __BTRFS_COMMANDS_H__
 
 enum {
-	CMD_HIDDEN = (1 << 0),	/* should not be in help listings */
-	CMD_ALIAS = (1 << 1),	/* alias of next command in cmd_group */
-	CMD_FORMAT_TEXT = (1 << 2),	/* output as plain text */
-	CMD_FORMAT_JSON = (1 << 3),	/* output in json */
+	CMD_HIDDEN	= (1U << 0),	/* should not be in help listings */
+	CMD_ALIAS	= (1U << 1),	/* alias of next command in cmd_group */
+	CMD_FORMAT_TEXT = (1U << 2),	/* output as plain text */
+	CMD_FORMAT_JSON = (1U << 3),	/* output in json */
+	CMD_DRY_RUN	= (1U << 4),	/* Accepts global --dry-run option. */
 };
 
 #define CMD_FORMAT_MASK		(CMD_FORMAT_TEXT | CMD_FORMAT_JSON)
@@ -130,6 +131,7 @@ int handle_command_group(const struct cmd_struct *cmd, int argc, char **argv);
 extern const char * const generic_cmd_help_usage[];
 
 DECLARE_COMMAND(subvolume);
+DECLARE_COMMAND(subvolume_list);
 DECLARE_COMMAND(filesystem);
 DECLARE_COMMAND(filesystem_du);
 DECLARE_COMMAND(filesystem_usage);
@@ -137,8 +139,6 @@ DECLARE_COMMAND(balance);
 DECLARE_COMMAND(device);
 DECLARE_COMMAND(scrub);
 DECLARE_COMMAND(check);
-DECLARE_COMMAND(chunk_recover);
-DECLARE_COMMAND(super_recover);
 DECLARE_COMMAND(inspect);
 DECLARE_COMMAND(inspect_dump_super);
 DECLARE_COMMAND(inspect_dump_tree);
@@ -146,13 +146,11 @@ DECLARE_COMMAND(inspect_tree_stats);
 DECLARE_COMMAND(property);
 DECLARE_COMMAND(send);
 DECLARE_COMMAND(receive);
+DECLARE_COMMAND(reflink);
 DECLARE_COMMAND(quota);
 DECLARE_COMMAND(qgroup);
 DECLARE_COMMAND(replace);
 DECLARE_COMMAND(restore);
-DECLARE_COMMAND(select_super);
-DECLARE_COMMAND(dump_super);
-DECLARE_COMMAND(debug_tree);
 DECLARE_COMMAND(rescue);
 
 #endif
